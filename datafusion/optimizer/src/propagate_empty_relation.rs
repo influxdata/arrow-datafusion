@@ -119,6 +119,7 @@ impl OptimizerRule for PropagateEmptyRelation {
                     return Ok(Some(LogicalPlan::Union(Union {
                         inputs: new_inputs,
                         schema: union.schema.clone(),
+                        skip_interleave: union.skip_interleave,
                     })));
                 }
             }

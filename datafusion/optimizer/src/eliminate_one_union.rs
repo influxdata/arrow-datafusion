@@ -110,6 +110,7 @@ mod tests {
         let single_union_plan = LogicalPlan::Union(Union {
             inputs: vec![Arc::new(table_plan)],
             schema,
+            skip_interleave: false,
         });
 
         let expected = "TableScan: table";

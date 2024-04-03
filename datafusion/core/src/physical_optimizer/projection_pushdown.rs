@@ -528,7 +528,10 @@ fn try_pushdown_through_union(
         .map(|child| make_with_child(projection, &child))
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(Some(Arc::new(UnionExec::new(new_children))))
+    Ok(Some(Arc::new(UnionExec::new_with_skip_interleave(
+        new_children,
+        union.skip_interleave(),
+    ))))
 }
 
 /// Some projection can't be pushed down left input or right input of hash join because filter or on need may need some columns that won't be used in later.

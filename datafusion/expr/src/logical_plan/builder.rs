@@ -564,6 +564,15 @@ impl LogicalPlanBuilder {
             .map(Self::from)
     }
 
+    /// Apply a union with skip interlave, preserving duplicate rows
+    pub fn union_with_skip_interleave(
+        self,
+        plan: LogicalPlan,
+        skip_interleave: bool,
+    ) -> Result<Self> {
+        union_with_skip_interleave(self.plan, plan, skip_interleave).map(Self::from)
+    }
+
     /// Apply a union, preserving duplicate rows
     pub fn union(self, plan: LogicalPlan) -> Result<Self> {
         union(self.plan, plan).map(Self::from)
@@ -1303,6 +1312,15 @@ pub fn project_with_column_index(
 
 /// Union two logical plans.
 pub fn union(left_plan: LogicalPlan, right_plan: LogicalPlan) -> Result<LogicalPlan> {
+    union_with_skip_interleave(left_plan, right_plan, false)
+}
+
+/// Union two logical plans with skip interleave.
+pub fn union_with_skip_interleave(
+    left_plan: LogicalPlan,
+    right_plan: LogicalPlan,
+    skip_interleave: bool,
+) -> Result<LogicalPlan> {
     let left_col_num = left_plan.schema().fields().len();
 
     // check union plan length same.
@@ -1365,6 +1383,7 @@ pub fn union(left_plan: LogicalPlan, right_plan: LogicalPlan) -> Result<LogicalP
     Ok(LogicalPlan::Union(Union {
         inputs,
         schema: Arc::new(union_schema),
+        skip_interleave,
     }))
 }
 

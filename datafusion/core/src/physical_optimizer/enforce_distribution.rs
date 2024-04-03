@@ -1216,33 +1216,37 @@ fn ensure_distribution(
     .collect::<Result<Vec<_>>>()?;
 
     let children_plans = children.iter().map(|c| c.plan.clone()).collect::<Vec<_>>();
-    plan = if plan.as_any().is::<UnionExec>() && can_interleave(children_plans.iter()) {
-        // Add a special case for [`UnionExec`] since we want to "bubble up"
-        // hash-partitioned data. So instead of
-        //
-        // Agg:
-        //   Repartition (hash):
-        //     Union:
-        //       - Agg:
-        //           Repartition (hash):
-        //             Data
-        //       - Agg:
-        //           Repartition (hash):
-        //             Data
-        //
-        // we can use:
-        //
-        // Agg:
-        //   Interleave:
-        //     - Agg:
-        //         Repartition (hash):
-        //           Data
-        //     - Agg:
-        //         Repartition (hash):
-        //           Data
-        Arc::new(InterleaveExec::try_new(children_plans)?)
+    if let Some(union_exec) = plan.as_any().downcast_ref::<UnionExec>() {
+        if !union_exec.skip_interleave() && can_interleave(children_plans.iter()) {
+            // Add a special case for [`UnionExec`] since we want to "bubble up"
+            // hash-partitioned data. So instead of
+            //
+            // Agg:
+            //   Repartition (hash):
+            //     Union:
+            //       - Agg:
+            //           Repartition (hash):
+            //             Data
+            //       - Agg:
+            //           Repartition (hash):
+            //             Data
+            //
+            // we can use:
+            //
+            // Agg:
+            //   Interleave:
+            //     - Agg:
+            //         Repartition (hash):
+            //           Data
+            //     - Agg:
+            //         Repartition (hash):
+            //           Data
+            plan = Arc::new(InterleaveExec::try_new(children_plans)?)
+        } else {
+            plan = plan.with_new_children(children_plans)?
+        }
     } else {
-        plan.with_new_children(children_plans)?
+        plan = plan.with_new_children(children_plans)?
     };
 
     Ok(Transformed::yes(DistributionContext::new(

@@ -809,7 +809,11 @@ impl LogicalPlan {
             LogicalPlan::Extension(e) => Ok(LogicalPlan::Extension(Extension {
                 node: e.node.from_template(&expr, &inputs),
             })),
-            LogicalPlan::Union(Union { schema, .. }) => {
+            LogicalPlan::Union(Union {
+                schema,
+                skip_interleave,
+                ..
+            }) => {
                 let input_schema = inputs[0].schema();
                 // If inputs are not pruned do not change schema.
                 let schema = if schema.fields().len() == input_schema.fields().len() {
@@ -820,6 +824,7 @@ impl LogicalPlan {
                 Ok(LogicalPlan::Union(Union {
                     inputs: inputs.into_iter().map(Arc::new).collect(),
                     schema,
+                    skip_interleave: *skip_interleave,
                 }))
             }
             LogicalPlan::Distinct(distinct) => {
@@ -2212,6 +2217,8 @@ pub struct Union {
     pub inputs: Vec<Arc<LogicalPlan>>,
     /// Union schema. Should be the same for all inputs.
     pub schema: DFSchemaRef,
+    /// Skip Intervleave optimization
+    pub skip_interleave: bool,
 }
 
 /// Prepare a statement but do not execute it. Prepare statements can have 0 or more

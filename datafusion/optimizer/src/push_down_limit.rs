@@ -142,6 +142,7 @@ impl OptimizerRule for PushDownLimit {
                 let union = LogicalPlan::Union(Union {
                     inputs: new_inputs,
                     schema: union.schema.clone(),
+                    skip_interleave: union.skip_interleave,
                 });
                 plan.with_new_exprs(plan.expressions(), vec![union])
                     .map(Some)

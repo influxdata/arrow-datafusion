@@ -114,6 +114,7 @@ mod tests {
         let five_node_plan = Arc::new(LogicalPlan::Union(datafusion_expr::Union {
             inputs: vec![two_node_plan.clone(), two_node_plan],
             schema,
+            skip_interleave: false,
         }));
 
         assert_eq!(5, get_node_number(&five_node_plan).get());

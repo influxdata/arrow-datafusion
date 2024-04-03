@@ -777,6 +777,7 @@ impl OptimizerRule for PushDownFilter {
                 LogicalPlan::Union(Union {
                     inputs,
                     schema: plan.schema().clone(),
+                    skip_interleave: union.skip_interleave,
                 })
             }
             LogicalPlan::Aggregate(agg) => {

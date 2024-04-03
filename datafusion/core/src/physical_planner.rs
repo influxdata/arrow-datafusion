@@ -917,10 +917,10 @@ impl DefaultPhysicalPlanner {
                     let filter = FilterExec::try_new(runtime_expr, physical_input)?;
                     Ok(Arc::new(filter.with_default_selectivity(selectivity)?))
                 }
-                LogicalPlan::Union(Union { inputs, schema: _ }) => {
+                LogicalPlan::Union(Union { inputs, schema: _, skip_interleave }) => {
                     let physical_plans = self.create_initial_plan_multi(inputs.iter().map(|lp| lp.as_ref()), session_state).await?;
 
-                    Ok(Arc::new(UnionExec::new(physical_plans)))
+                    Ok(Arc::new(UnionExec::new_with_skip_interleave(physical_plans, *skip_interleave)))
                 }
                 LogicalPlan::Repartition(Repartition {
                     input,

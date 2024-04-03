@@ -93,18 +93,33 @@ pub struct UnionExec {
     metrics: ExecutionPlanMetricsSet,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: PlanProperties,
+    /// Skip Intervleave optimization
+    pub skip_interleave: bool,
 }
 
 impl UnionExec {
     /// Create a new UnionExec
     pub fn new(inputs: Vec<Arc<dyn ExecutionPlan>>) -> Self {
+        Self::new_with_skip_interleave(inputs, false)
+    }
+
+    /// Create a new UnionExec with skip interleave optimization
+    pub fn new_with_skip_interleave(
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        skip_interleave: bool,
+    ) -> Self {
         let schema = union_schema(&inputs);
         let cache = Self::compute_properties(&inputs, schema);
         UnionExec {
             inputs,
             metrics: ExecutionPlanMetricsSet::new(),
             cache,
+            skip_interleave,
         }
+    }
+
+    pub fn skip_interleave(&self) -> bool {
+        self.skip_interleave
     }
 
     /// Get inputs of the execution plan
@@ -225,7 +240,10 @@ impl ExecutionPlan for UnionExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(UnionExec::new(children)))
+        Ok(Arc::new(UnionExec::new_with_skip_interleave(
+            children,
+            self.skip_interleave,
+        )))
     }
 
     fn execute(
