@@ -69,11 +69,14 @@ use datafusion_common::{
     OwnedTableReference, SchemaReference,
 };
 use datafusion_execution::registry::SerializerRegistry;
+use datafusion_expr::type_coercion::aggregates::NUMERICS;
+use datafusion_expr::{create_first_value, Signature, Volatility};
 use datafusion_expr::{
     logical_plan::{DdlStatement, Statement},
     var_provider::is_system_variables,
     Expr, StringifiedPlan, UserDefinedLogicalNode, WindowUDF,
 };
+use datafusion_physical_expr::create_first_value_accumulator;
 use datafusion_sql::{
     parser::{CopyToSource, CopyToStatement, DFParser},
     planner::{object_name_to_table_reference, ContextProvider, ParserOptions, SqlToRel},
@@ -82,6 +85,7 @@ use datafusion_sql::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use log::debug;
 use parking_lot::RwLock;
 use sqlparser::dialect::dialect_from_str;
 use url::Url;
@@ -721,10 +725,7 @@ impl SessionContext {
         }
     }
 
-    fn schema_doesnt_exist_err(
-        &self,
-        schemaref: SchemaReference<'_>,
-    ) -> Result<DataFrame> {
+    fn schema_doesnt_exist_err(&self, schemaref: SchemaReference) -> Result<DataFrame> {
         exec_err!("Schema '{schemaref}' doesn't exist.")
     }
 
@@ -762,7 +763,7 @@ impl SessionContext {
 
     async fn find_and_deregister<'a>(
         &self,
-        table_ref: impl Into<TableReference<'a>>,
+        table_ref: impl Into<TableReference>,
         table_type: TableType,
     ) -> Result<bool> {
         let table_ref = table_ref.into();
@@ -1103,9 +1104,9 @@ impl SessionContext {
     ///
     /// Returns the [`TableProvider`] previously registered for this
     /// reference, if any
-    pub fn register_table<'a>(
-        &'a self,
-        table_ref: impl Into<TableReference<'a>>,
+    pub fn register_table(
+        &self,
+        table_ref: impl Into<TableReference>,
         provider: Arc<dyn TableProvider>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         let table_ref = table_ref.into();
@@ -1119,9 +1120,9 @@ impl SessionContext {
     /// Deregisters the given table.
     ///
     /// Returns the registered provider, if any
-    pub fn deregister_table<'a>(
-        &'a self,
-        table_ref: impl Into<TableReference<'a>>,
+    pub fn deregister_table(
+        &self,
+        table_ref: impl Into<TableReference>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_owned();
@@ -1132,10 +1133,7 @@ impl SessionContext {
     }
 
     /// Return `true` if the specified table exists in the schema provider.
-    pub fn table_exist<'a>(
-        &'a self,
-        table_ref: impl Into<TableReference<'a>>,
-    ) -> Result<bool> {
+    pub fn table_exist(&self, table_ref: impl Into<TableReference>) -> Result<bool> {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_owned();
         Ok(self
@@ -1154,7 +1152,7 @@ impl SessionContext {
     /// [`register_table`]: SessionContext::register_table
     pub async fn table<'a>(
         &self,
-        table_ref: impl Into<TableReference<'a>>,
+        table_ref: impl Into<TableReference>,
     ) -> Result<DataFrame> {
         let table_ref = table_ref.into();
         let provider = self.table_provider(table_ref.to_owned_reference()).await?;
@@ -1170,7 +1168,7 @@ impl SessionContext {
     /// Return a [`TableProvider`] for the specified table.
     pub async fn table_provider<'a>(
         &self,
-        table_ref: impl Into<TableReference<'a>>,
+        table_ref: impl Into<TableReference>,
     ) -> Result<Arc<dyn TableProvider>> {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_string();
@@ -1457,6 +1455,22 @@ impl SessionState {
         datafusion_functions_array::register_all(&mut new_self)
             .expect("can not register array expressions");
 
+        let first_value = create_first_value(
+            "FIRST_VALUE",
+            Signature::uniform(1, NUMERICS.to_vec(), Volatility::Immutable),
+            Arc::new(create_first_value_accumulator),
+        );
+
+        match new_self.register_udaf(Arc::new(first_value)) {
+            Ok(Some(existing_udaf)) => {
+                debug!("Overwrite existing UDAF: {}", existing_udaf.name());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                panic!("Failed to register UDAF: {}", err);
+            }
+        }
+
         new_self
     }
     /// Returns new [`SessionState`] using the provided
@@ -1518,22 +1532,23 @@ impl SessionState {
             .expect("Failed to register default schema");
     }
 
-    fn resolve_table_ref<'a>(
-        &'a self,
-        table_ref: impl Into<TableReference<'a>>,
-    ) -> ResolvedTableReference<'a> {
+    fn resolve_table_ref(
+        &self,
+        table_ref: impl Into<TableReference>,
+    ) -> ResolvedTableReference {
         let catalog = &self.config_options().catalog;
         table_ref
             .into()
             .resolve(&catalog.default_catalog, &catalog.default_schema)
     }
 
-    pub(crate) fn schema_for_ref<'a>(
-        &'a self,
-        table_ref: impl Into<TableReference<'a>>,
+    pub(crate) fn schema_for_ref(
+        &self,
+        table_ref: impl Into<TableReference>,
     ) -> Result<Arc<dyn SchemaProvider>> {
         let resolved_ref = self.resolve_table_ref(table_ref);
-        if self.config.information_schema() && resolved_ref.schema == INFORMATION_SCHEMA {
+        if self.config.information_schema() && *resolved_ref.schema == *INFORMATION_SCHEMA
+        {
             return Ok(Arc::new(InformationSchemaProvider::new(
                 self.catalog_list.clone(),
             )));

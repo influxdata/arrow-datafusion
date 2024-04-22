@@ -21,15 +21,17 @@ use crate::expr::{
     AggregateFunction, BinaryExpr, Cast, Exists, GroupingSet, InList, InSubquery,
     Placeholder, ScalarFunction, TryCast,
 };
-use crate::function::PartitionEvaluatorFactory;
+use crate::function::{
+    AccumulatorArgs, AccumulatorFactoryFunction, PartitionEvaluatorFactory,
+};
+use crate::udaf::format_state_name;
 use crate::{
     aggregate_function, built_in_function, conditional_expressions::CaseBuilder,
-    logical_plan::Subquery, AccumulatorFactoryFunction, AggregateUDF,
-    BuiltinScalarFunction, Expr, LogicalPlan, Operator, ScalarFunctionImplementation,
-    ScalarUDF, Signature, Volatility,
+    logical_plan::Subquery, AggregateUDF, BuiltinScalarFunction, Expr, LogicalPlan,
+    Operator, ScalarFunctionImplementation, ScalarUDF, Signature, Volatility,
 };
 use crate::{AggregateUDFImpl, ColumnarValue, ScalarUDFImpl, WindowUDF, WindowUDFImpl};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use datafusion_common::{Column, Result};
 use std::any::Any;
 use std::fmt::Debug;
@@ -534,13 +536,10 @@ macro_rules! nary_scalar_expr {
 // generate methods for creating the supported unary/binary expressions
 
 // math functions
-scalar_expr!(Sqrt, sqrt, num, "square root of a number");
 scalar_expr!(Cbrt, cbrt, num, "cube root of a number");
-scalar_expr!(Sin, sin, num, "sine");
-scalar_expr!(Cos, cos, num, "cosine");
-scalar_expr!(Cot, cot, num, "cotangent");
-scalar_expr!(Sinh, sinh, num, "hyperbolic sine");
-scalar_expr!(Cosh, cosh, num, "hyperbolic cosine");
+scalar_expr!(Cos, cos, num, "cosine of a number");
+scalar_expr!(Cot, cot, num, "cotangent of a number");
+scalar_expr!(Cosh, cosh, num, "hyperbolic cosine of a number");
 scalar_expr!(Factorial, factorial, num, "factorial");
 scalar_expr!(
     Floor,
@@ -555,14 +554,12 @@ scalar_expr!(
     "nearest integer greater than or equal to argument"
 );
 scalar_expr!(Degrees, degrees, num, "converts radians to degrees");
-scalar_expr!(Radians, radians, num, "converts degrees to radians");
 nary_scalar_expr!(Round, round, "round to nearest integer");
 nary_scalar_expr!(
     Trunc,
     trunc,
     "truncate toward zero, with optional precision"
 );
-scalar_expr!(Signum, signum, num, "sign of the argument (-1, 0, +1) ");
 scalar_expr!(Exp, exp, num, "exponential");
 scalar_expr!(Gcd, gcd, arg_1 arg_2, "greatest common divisor");
 scalar_expr!(Lcm, lcm, arg_1 arg_2, "least common multiple");
@@ -700,14 +697,30 @@ pub fn create_udaf(
 ) -> AggregateUDF {
     let return_type = Arc::try_unwrap(return_type).unwrap_or_else(|t| t.as_ref().clone());
     let state_type = Arc::try_unwrap(state_type).unwrap_or_else(|t| t.as_ref().clone());
+    let state_fields = state_type
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| Field::new(format!("{i}"), t, true))
+        .collect::<Vec<_>>();
     AggregateUDF::from(SimpleAggregateUDF::new(
         name,
         input_type,
         return_type,
         volatility,
         accumulator,
-        state_type,
+        state_fields,
     ))
+}
+
+/// Creates a new UDAF with a specific signature, state type and return type.
+/// The signature and state type must match the `Accumulator's implementation`.
+/// TOOD: We plan to move aggregate function to its own crate. This function will be deprecated then.
+pub fn create_first_value(
+    name: &str,
+    signature: Signature,
+    accumulator: AccumulatorFactoryFunction,
+) -> AggregateUDF {
+    AggregateUDF::from(FirstValue::new(name, signature, accumulator))
 }
 
 /// Implements [`AggregateUDFImpl`] for functions that have a single signature and
@@ -717,7 +730,7 @@ pub struct SimpleAggregateUDF {
     signature: Signature,
     return_type: DataType,
     accumulator: AccumulatorFactoryFunction,
-    state_type: Vec<DataType>,
+    state_fields: Vec<Field>,
 }
 
 impl Debug for SimpleAggregateUDF {
@@ -739,7 +752,7 @@ impl SimpleAggregateUDF {
         return_type: DataType,
         volatility: Volatility,
         accumulator: AccumulatorFactoryFunction,
-        state_type: Vec<DataType>,
+        state_fields: Vec<Field>,
     ) -> Self {
         let name = name.into();
         let signature = Signature::exact(input_type, volatility);
@@ -748,7 +761,7 @@ impl SimpleAggregateUDF {
             signature,
             return_type,
             accumulator,
-            state_type,
+            state_fields,
         }
     }
 
@@ -757,7 +770,7 @@ impl SimpleAggregateUDF {
         signature: Signature,
         return_type: DataType,
         accumulator: AccumulatorFactoryFunction,
-        state_type: Vec<DataType>,
+        state_fields: Vec<Field>,
     ) -> Self {
         let name = name.into();
         Self {
@@ -765,7 +778,7 @@ impl SimpleAggregateUDF {
             signature,
             return_type,
             accumulator,
-            state_type,
+            state_fields,
         }
     }
 }
@@ -787,12 +800,92 @@ impl AggregateUDFImpl for SimpleAggregateUDF {
         Ok(self.return_type.clone())
     }
 
-    fn accumulator(&self, arg: &DataType) -> Result<Box<dyn crate::Accumulator>> {
-        (self.accumulator)(arg)
+    fn accumulator(
+        &self,
+        acc_args: AccumulatorArgs,
+    ) -> Result<Box<dyn crate::Accumulator>> {
+        (self.accumulator)(acc_args)
     }
 
-    fn state_type(&self, _return_type: &DataType) -> Result<Vec<DataType>> {
-        Ok(self.state_type.clone())
+    fn state_fields(
+        &self,
+        _name: &str,
+        _value_type: DataType,
+        _ordering_fields: Vec<Field>,
+    ) -> Result<Vec<Field>> {
+        Ok(self.state_fields.clone())
+    }
+}
+
+pub struct FirstValue {
+    name: String,
+    signature: Signature,
+    accumulator: AccumulatorFactoryFunction,
+}
+
+impl Debug for FirstValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("FirstValue")
+            .field("name", &self.name)
+            .field("signature", &self.signature)
+            .field("accumulator", &"<FUNC>")
+            .finish()
+    }
+}
+
+impl FirstValue {
+    pub fn new(
+        name: impl Into<String>,
+        signature: Signature,
+        accumulator: AccumulatorFactoryFunction,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            name,
+            signature,
+            accumulator,
+        }
+    }
+}
+
+impl AggregateUDFImpl for FirstValue {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn accumulator(
+        &self,
+        acc_args: AccumulatorArgs,
+    ) -> Result<Box<dyn crate::Accumulator>> {
+        (self.accumulator)(acc_args)
+    }
+
+    fn state_fields(
+        &self,
+        name: &str,
+        value_type: DataType,
+        ordering_fields: Vec<Field>,
+    ) -> Result<Vec<Field>> {
+        let mut fields = vec![Field::new(
+            format_state_name(name, "first_value"),
+            value_type,
+            true,
+        )];
+        fields.extend(ordering_fields);
+        fields.push(Field::new("is_set", DataType::Boolean, true));
+        Ok(fields)
     }
 }
 
@@ -885,8 +978,8 @@ impl WindowUDFImpl for SimpleWindowUDF {
 /// ```
 /// use datafusion_expr::{col, lit, call_fn};
 ///
-/// // create the expression sin(x) < 0.2
-/// let expr = call_fn("sin", vec![col("x")]).unwrap().lt(lit(0.2));
+/// // create the expression trunc(x) < 0.2
+/// let expr = call_fn("trunc", vec![col("x")]).unwrap().lt(lit(0.2));
 /// ```
 pub fn call_fn(name: impl AsRef<str>, args: Vec<Expr>) -> Result<Expr> {
     match name.as_ref().parse::<BuiltinScalarFunction>() {
@@ -967,23 +1060,18 @@ mod test {
 
     #[test]
     fn scalar_function_definitions() {
-        test_unary_scalar_expr!(Sqrt, sqrt);
         test_unary_scalar_expr!(Cbrt, cbrt);
-        test_unary_scalar_expr!(Sin, sin);
         test_unary_scalar_expr!(Cos, cos);
         test_unary_scalar_expr!(Cot, cot);
-        test_unary_scalar_expr!(Sinh, sinh);
         test_unary_scalar_expr!(Cosh, cosh);
         test_unary_scalar_expr!(Factorial, factorial);
         test_unary_scalar_expr!(Floor, floor);
         test_unary_scalar_expr!(Ceil, ceil);
         test_unary_scalar_expr!(Degrees, degrees);
-        test_unary_scalar_expr!(Radians, radians);
         test_nary_scalar_expr!(Round, round, input);
         test_nary_scalar_expr!(Round, round, input, decimal_places);
         test_nary_scalar_expr!(Trunc, trunc, num);
         test_nary_scalar_expr!(Trunc, trunc, num, precision);
-        test_unary_scalar_expr!(Signum, signum);
         test_unary_scalar_expr!(Exp, exp);
         test_scalar_expr!(Nanvl, nanvl, x, y);
         test_scalar_expr!(Iszero, iszero, input);
