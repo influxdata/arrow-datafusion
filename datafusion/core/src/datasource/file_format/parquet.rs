@@ -1136,7 +1136,7 @@ mod tests {
     };
     use parquet::arrow::arrow_reader::ArrowReaderOptions;
     use parquet::arrow::ParquetRecordBatchStreamBuilder;
-    use parquet::file::metadata::{KeyValue, ParquetColumnIndex, ParquetOffsetIndex};
+    use parquet::file::metadata::{ParquetColumnIndex, ParquetOffsetIndex};
     use parquet::file::page_index::index::Index;
     use tokio::fs::File;
     use tokio::io::AsyncWrite;
@@ -1866,10 +1866,10 @@ mod tests {
         let parquet_sink = Arc::new(ParquetSink::new(
             file_sink_config,
             TableParquetOptions {
-                key_value_metadata: Some(vec![KeyValue {
-                    key: "my-data".into(),
-                    value: Some("stuff".to_string()),
-                }]),
+                key_value_metadata: std::collections::HashMap::from([(
+                    "my-data".to_string(),
+                    Some("stuff".to_string()),
+                )]),
                 ..Default::default()
             },
         ));
