@@ -88,7 +88,8 @@ impl TryFrom<&TableParquetOptions> for ParquetWriterOptions {
             .set_created_by(created_by.clone())
             .set_column_index_truncate_length(*column_index_truncate_length)
             .set_data_page_row_count_limit(*data_page_row_count_limit)
-            .set_bloom_filter_enabled(*bloom_filter_enabled);
+            .set_bloom_filter_enabled(*bloom_filter_enabled)
+            .set_key_value_metadata(parquet_options.key_value_metadata.clone());
 
         if let Some(encoding) = &encoding {
             builder = builder.set_encoding(parse_encoding_string(encoding)?);

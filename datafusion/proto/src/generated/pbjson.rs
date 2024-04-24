@@ -26318,6 +26318,7 @@ impl<'de> serde::Deserialize<'de> for TableParquetOptions {
                 Ok(TableParquetOptions {
                     global: global__,
                     column_specific_options: column_specific_options__.unwrap_or_default(),
+                    key_value_metadata: None,
                 })
             }
         }

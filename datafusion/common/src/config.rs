@@ -22,6 +22,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Display};
 use std::str::FromStr;
 
+#[cfg(feature = "parquet")]
+use parquet::file::metadata::KeyValue;
+
 use crate::error::_config_err;
 use crate::parsers::CompressionTypeVariant;
 use crate::{DataFusionError, FileType, Result};
@@ -1368,6 +1371,10 @@ pub struct TableParquetOptions {
     pub global: ParquetOptions,
     /// Column specific options. Default usage is parquet.XX::column.
     pub column_specific_options: HashMap<String, ColumnOptions>,
+    /// Optional, additional metadata to be inserted into the key_value_metadata
+    /// for the written [`FileMetaData`](https://docs.rs/parquet/latest/parquet/file/metadata/struct.FileMetaData.html).
+    #[cfg(feature = "parquet")]
+    pub key_value_metadata: Option<Vec<KeyValue>>,
 }
 
 impl ConfigField for TableParquetOptions {
