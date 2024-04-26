@@ -974,6 +974,7 @@ impl TryFrom<&protobuf::TableParquetOptions> for TableParquetOptions {
                 .unwrap()
                 .unwrap(),
             column_specific_options,
+            key_value_metadata: Default::default(),
         })
     }
 }
