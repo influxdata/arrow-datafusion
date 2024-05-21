@@ -25,7 +25,7 @@ use datafusion_common::{
     ScalarValue,
 };
 use datafusion_expr::{
-    expr::{Alias, Exists, InList, ScalarFunction, Sort, WindowFunction},
+    expr::{Alias, Exists, InList, ScalarFunction, Sort, TryCast, WindowFunction},
     Between, BinaryExpr, Case, Cast, Expr, Like, Operator,
 };
 use sqlparser::ast::{
@@ -393,10 +393,14 @@ impl Unparser<'_> {
             }
             Expr::IsNull(_) => not_impl_err!("Unsupported Expr conversion: {expr:?}"),
             Expr::IsNotFalse(_) => not_impl_err!("Unsupported Expr conversion: {expr:?}"),
-            Expr::GetIndexedField(_) => {
-                not_impl_err!("Unsupported Expr conversion: {expr:?}")
+            Expr::TryCast(TryCast { expr, data_type }) => {
+                let inner_expr = self.expr_to_sql(expr)?;
+                Ok(ast::Expr::TryCast {
+                    expr: Box::new(inner_expr),
+                    data_type: self.arrow_dtype_to_ast_dtype(data_type)?,
+                    format: None,
+                })
             }
-            Expr::TryCast(_) => not_impl_err!("Unsupported Expr conversion: {expr:?}"),
             Expr::Wildcard { qualifier: _ } => {
                 not_impl_err!("Unsupported Expr conversion: {expr:?}")
             }
