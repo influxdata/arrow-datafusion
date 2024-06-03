@@ -77,7 +77,8 @@ impl FirstValue {
                 vec![
                     // TODO: we can introduce more strict signature that only numeric of array types are allowed
                     TypeSignature::ArraySignature(ArrayFunctionSignature::Array),
-                    TypeSignature::Uniform(1, NUMERICS.to_vec()),
+                    TypeSignature::Numeric(1),
+                    TypeSignature::Uniform(1, vec![DataType::Utf8]),
                 ],
                 Volatility::Immutable,
             ),
