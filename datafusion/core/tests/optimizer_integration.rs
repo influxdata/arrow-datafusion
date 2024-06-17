@@ -86,7 +86,7 @@ fn timestamp_nano_ts_utc_predicates() {
     // constant and compared to the column without a cast so it can be
     // pushed down / pruned
     let expected =
-        "Projection: test.col_int32\n  Filter: test.col_ts_nano_utc < TimestampNanosecond(1666612093000000000, Some(\"+00:00\"))\
+        "Projection: test.col_int32\n  Filter: test.col_ts_nano_utc < TimestampNanosecond(1666612093000000000, Some(\"UTC\"))\
          \n    TableScan: test projection=[col_int32, col_ts_nano_utc]";
     assert_eq!(expected, format!("{plan:?}"));
 }
@@ -180,7 +180,7 @@ impl ContextProvider for MyContextProvider {
                     // timestamp with UTC timezone
                     Field::new(
                         "col_ts_nano_utc",
-                        DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
                         true,
                     ),
                 ],

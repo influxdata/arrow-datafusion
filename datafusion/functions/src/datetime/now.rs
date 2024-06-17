@@ -64,7 +64,7 @@ impl ScalarUDFImpl for NowFunc {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(Timestamp(Nanosecond, Some("+00:00".into())))
+        Ok(Timestamp(Nanosecond, Some("UTC".into())))
     }
 
     fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
@@ -81,7 +81,7 @@ impl ScalarUDFImpl for NowFunc {
             .query_execution_start_time
             .timestamp_nanos_opt();
         Ok(ExprSimplifyResult::Simplified(Expr::Literal(
-            ScalarValue::TimestampNanosecond(now_ts, Some("+00:00".into())),
+            ScalarValue::TimestampNanosecond(now_ts, Some("UTC".into())),
         )))
     }
 }

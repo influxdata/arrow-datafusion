@@ -67,7 +67,7 @@ Timestamp(Nanosecond, None)
 query T
 SELECT arrow_typeof(now())
 ----
-Timestamp(Nanosecond, Some("+00:00"))
+Timestamp(Nanosecond, Some("UTC"))
 
 # arrow_typeof_timestamp_date32(
 query T
@@ -322,7 +322,7 @@ select arrow_cast('30 minutes', 'Duration(Second)');
 ## Timestamptz
 
 query P
-select arrow_cast(timestamp '2000-01-01T00:00:00', 'Timestamp(Nanosecond, Some( "+00:00" ))');
+select arrow_cast(timestamp '2000-01-01T00:00:00', 'Timestamp(Nanosecond, Some( "UTC" ))');
 ----
 2000-01-01T00:00:00Z
 
