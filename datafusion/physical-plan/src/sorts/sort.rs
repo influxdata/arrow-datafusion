@@ -291,7 +291,11 @@ impl ExternalSorter {
         self.reserve_memory_for_merge()?;
 
         let size = input.get_array_memory_size();
-        if self.reservation.try_grow(size).is_err() {
+        if self
+            .reservation
+            .try_grow("ExternalSorter::insert_batch", size)
+            .is_err()
+        {
             let before = self.reservation.size();
             self.in_mem_sort().await?;
             // Sorting may have freed memory, especially if fetch is `Some`
@@ -304,10 +308,14 @@ impl ExternalSorter {
             // memory required for `fetch` is just under the memory available,
             // causing repeated re-sorting of data
             if self.reservation.size() > before / 2
-                || self.reservation.try_grow(size).is_err()
+                || self
+                    .reservation
+                    .try_grow("ExternalSorter::insert_batch", size)
+                    .is_err()
             {
                 self.spill().await?;
-                self.reservation.try_grow(size)?
+                self.reservation
+                    .try_grow("ExternalSorter::insert_batch", size)?
             }
         }
 
@@ -356,7 +364,7 @@ impl ExternalSorter {
                 self.metrics.baseline.clone(),
                 self.batch_size,
                 self.fetch,
-                self.reservation.new_empty(),
+                self.reservation.new_empty("ExternalSorter::sort"),
             )
         } else if !self.in_mem_batches.is_empty() {
             self.in_mem_sort_stream(self.metrics.baseline.clone())
@@ -436,7 +444,8 @@ impl ExternalSorter {
         // Reserve headroom for next sort/merge
         self.reserve_memory_for_merge()?;
 
-        self.reservation.try_resize(size)?;
+        self.reservation
+            .try_resize("ExternalSorter::in_mem_sort", size)?;
         self.in_mem_batches_sorted = true;
         Ok(())
     }
@@ -506,7 +515,7 @@ impl ExternalSorter {
         assert_ne!(self.in_mem_batches.len(), 0);
         if self.in_mem_batches.len() == 1 {
             let batch = self.in_mem_batches.remove(0);
-            let reservation = self.reservation.take();
+            let reservation = self.reservation.take("ExternalSorter::in_mem_sort_stream");
             return self.sort_batch_stream(batch, metrics, reservation);
         }
 
@@ -515,8 +524,11 @@ impl ExternalSorter {
             // Concatenate memory batches together and sort
             let batch = concat_batches(&self.schema, &self.in_mem_batches)?;
             self.in_mem_batches.clear();
-            self.reservation.try_resize(batch.get_array_memory_size())?;
-            let reservation = self.reservation.take();
+            self.reservation.try_resize(
+                "ExternalSorter::in_mem_sort_stream",
+                batch.get_array_memory_size(),
+            )?;
+            let reservation = self.reservation.take("ExternalSorter::in_mem_sort_stream");
             return self.sort_batch_stream(batch, metrics, reservation);
         }
 
@@ -524,7 +536,10 @@ impl ExternalSorter {
             .into_iter()
             .map(|batch| {
                 let metrics = self.metrics.baseline.intermediate();
-                let reservation = self.reservation.split(batch.get_array_memory_size());
+                let reservation = self.reservation.split(
+                    "ExternalSorter::in_mem_sort_stream",
+                    batch.get_array_memory_size(),
+                );
                 let input = self.sort_batch_stream(batch, metrics, reservation)?;
                 Ok(spawn_buffered(input, 1))
             })
@@ -537,7 +552,8 @@ impl ExternalSorter {
             metrics,
             self.batch_size,
             self.fetch,
-            self.merge_reservation.new_empty(),
+            self.merge_reservation
+                .new_empty("ExternalSorter::in_mem_sort_stream"),
         )
     }
 
@@ -574,7 +590,8 @@ impl ExternalSorter {
         if self.runtime.disk_manager.tmp_files_enabled() {
             let size = self.sort_spill_reservation_bytes;
             if self.merge_reservation.size() != size {
-                self.merge_reservation.try_resize(size)?;
+                self.merge_reservation
+                    .try_resize("ExternalSorter::reserve_memory_for_merge", size)?;
             }
         }
 

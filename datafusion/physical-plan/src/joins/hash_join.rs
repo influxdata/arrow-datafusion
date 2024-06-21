@@ -860,7 +860,8 @@ async fn collect_left_input(
         .try_fold(initial, |mut acc, batch| async {
             let batch_size = batch.get_array_memory_size();
             // Reserve memory for incoming batch
-            acc.3.try_grow(batch_size)?;
+            acc.3
+                .try_grow("hash_join::collect_left_input", batch_size)?;
             // Update metrics
             acc.2.build_mem_used.add(batch_size);
             acc.2.build_input_batches.add(1);
@@ -879,7 +880,7 @@ async fn collect_left_input(
     let estimated_hashtable_size =
         estimate_memory_size::<(u64, u64)>(num_rows, fixed_size)?;
 
-    reservation.try_grow(estimated_hashtable_size)?;
+    reservation.try_grow("hash_join::collect_left_input", estimated_hashtable_size)?;
     metrics.build_mem_used.add(estimated_hashtable_size);
 
     let mut hashmap = JoinHashMap::with_capacity(num_rows);
@@ -909,7 +910,7 @@ async fn collect_left_input(
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
         let bitmap_size = bit_util::ceil(single_batch.num_rows(), 8);
-        reservation.try_grow(bitmap_size)?;
+        reservation.try_grow("hash_join::collect_left_input", bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
 
         let mut bitmap_buffer = BooleanBufferBuilder::new(single_batch.num_rows());

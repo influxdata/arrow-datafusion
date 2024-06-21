@@ -122,11 +122,13 @@ impl RowCursorStream {
             .collect::<Result<Vec<_>>>()?;
 
         let rows = self.converter.convert_columns(&cols)?;
-        self.reservation.try_resize(self.converter.size())?;
+        self.reservation
+            .try_resize("RowCursorStream::convert_batch", self.converter.size())?;
 
         // track the memory in the newly created Rows.
-        let mut rows_reservation = self.reservation.new_empty();
-        rows_reservation.try_grow(rows.size())?;
+        let mut rows_reservation =
+            self.reservation.new_empty("RowCursorStream::convert_batch");
+        rows_reservation.try_grow("RowCursorStream::convert_batch", rows.size())?;
         Ok(RowValues::new(rows, rows_reservation))
     }
 }

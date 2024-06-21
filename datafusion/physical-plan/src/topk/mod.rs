@@ -184,7 +184,8 @@ impl TopK {
         self.heap.maybe_compact()?;
 
         // update memory reservation
-        self.reservation.try_resize(self.size())?;
+        self.reservation
+            .try_resize("TopK::insert_batch", self.size())?;
         Ok(())
     }
 

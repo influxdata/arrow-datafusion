@@ -83,7 +83,7 @@ pub fn streaming_merge(
         schema.as_ref(),
         expressions,
         streams,
-        reservation.new_empty(),
+        reservation.new_empty("sorts::streaming_merge"),
     )?;
 
     Ok(Box::pin(SortPreservingMergeStream::new(

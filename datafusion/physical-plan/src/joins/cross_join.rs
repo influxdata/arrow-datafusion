@@ -161,7 +161,8 @@ async fn load_left_input(
             |mut acc, batch| async {
                 let batch_size = batch.get_array_memory_size();
                 // Reserve memory for incoming batch
-                acc.3.try_grow(batch_size)?;
+                acc.3
+                    .try_grow("CrossJoinExec::load_left_input", batch_size)?;
                 // Update metrics
                 acc.2.build_mem_used.add(batch_size);
                 acc.2.build_input_batches.add(1);

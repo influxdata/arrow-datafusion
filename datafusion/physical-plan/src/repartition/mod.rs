@@ -792,11 +792,15 @@ impl RepartitionExec {
                 let timer = metrics.send_time[partition].timer();
                 // if there is still a receiver, send to it
                 if let Some((tx, reservation)) = output_channels.get_mut(&partition) {
-                    reservation.lock().try_grow(size)?;
+                    reservation
+                        .lock()
+                        .try_grow("RepartitionExec::pull_from_input", size)?;
 
                     if tx.send(Some(Ok(batch))).await.is_err() {
                         // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
-                        reservation.lock().shrink(size);
+                        reservation
+                            .lock()
+                            .shrink("RepartitionExec::pull_from_input", size);
                         output_channels.remove(&partition);
                     }
                 }
@@ -908,9 +912,10 @@ impl Stream for RepartitionStream {
             match self.input.recv().poll_unpin(cx) {
                 Poll::Ready(Some(Some(v))) => {
                     if let Ok(batch) = &v {
-                        self.reservation
-                            .lock()
-                            .shrink(batch.get_array_memory_size());
+                        self.reservation.lock().shrink(
+                            "repartition::poll_next",
+                            batch.get_array_memory_size(),
+                        );
                     }
 
                     return Poll::Ready(Some(v));
@@ -973,7 +978,7 @@ impl Stream for PerPartitionStream {
                 if let Ok(batch) = &v {
                     self.reservation
                         .lock()
-                        .shrink(batch.get_array_memory_size());
+                        .shrink("repartition::poll_next", batch.get_array_memory_size());
                 }
                 Poll::Ready(Some(v))
             }

@@ -383,7 +383,8 @@ async fn collect_left_input(
             |mut acc, batch| async {
                 let batch_size = batch.get_array_memory_size();
                 // Reserve memory for incoming batch
-                acc.3.try_grow(batch_size)?;
+                acc.3
+                    .try_grow("nested_loop_join::collect_left_input", batch_size)?;
                 // Update metrics
                 acc.2.build_mem_used.add(batch_size);
                 acc.2.build_input_batches.add(1);
@@ -404,7 +405,7 @@ async fn collect_left_input(
         // TODO: Replace `ceil` wrapper with stable `div_cell` after
         // https://github.com/rust-lang/rust/issues/88581
         let buffer_size = bit_util::ceil(merged_batch.num_rows(), 8);
-        reservation.try_grow(buffer_size)?;
+        reservation.try_grow("nested_loop_join::collect_left_input", buffer_size)?;
         metrics.build_mem_used.add(buffer_size);
 
         let mut buffer = BooleanBufferBuilder::new(merged_batch.num_rows());
