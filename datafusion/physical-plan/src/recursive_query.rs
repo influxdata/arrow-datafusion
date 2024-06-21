@@ -278,7 +278,10 @@ impl RecursiveQueryStream {
         mut self: std::pin::Pin<&mut Self>,
         batch: RecordBatch,
     ) -> Poll<Option<Result<RecordBatch>>> {
-        if let Err(e) = self.reservation.try_grow(batch.get_array_memory_size()) {
+        if let Err(e) = self
+            .reservation
+            .try_grow("recursive_query::push_batch", batch.get_array_memory_size())
+        {
             return Poll::Ready(Some(Err(e)));
         }
 
@@ -305,7 +308,8 @@ impl RecursiveQueryStream {
         // Update the work table with the current buffer
         let reserved_batches = ReservedBatches::new(
             std::mem::take(&mut self.buffer),
-            self.reservation.take(),
+            self.reservation
+                .take("recursive_query::poll_next_iteration"),
         );
         self.work_table.update(reserved_batches);
 

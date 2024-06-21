@@ -126,9 +126,9 @@ impl AggregateStream {
                         // allocate memory
                         // This happens AFTER we actually used the memory, but simplifies the whole accounting and we are OK with
                         // overshooting a bit. Also this means we either store the whole record batch or not.
-                        match result
-                            .and_then(|allocated| this.reservation.try_grow(allocated))
-                        {
+                        match result.and_then(|allocated| {
+                            this.reservation.try_grow("AggregateStream::new", allocated)
+                        }) {
                             Ok(_) => continue,
                             Err(e) => Err(e),
                         }

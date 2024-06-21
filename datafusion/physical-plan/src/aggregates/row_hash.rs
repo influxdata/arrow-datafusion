@@ -615,6 +615,7 @@ impl GroupedHashAggregateStream {
     fn update_memory_reservation(&mut self) -> Result<()> {
         let acc = self.accumulators.iter().map(|x| x.size()).sum::<usize>();
         self.reservation.try_resize(
+            "GroupedHashAggregateStream::update_memory_reservation",
             acc + self.group_values.size()
                 + self.group_ordering.size()
                 + self.current_group_indices.allocated_size(),
@@ -763,7 +764,8 @@ impl GroupedHashAggregateStream {
             self.baseline_metrics.clone(),
             self.batch_size,
             None,
-            self.reservation.new_empty(),
+            self.reservation
+                .new_empty("GroupedHashAggregateStream::update_merged_stream"),
         )?;
         self.input_done = false;
         self.group_ordering = GroupOrdering::Full(GroupOrderingFull::new());

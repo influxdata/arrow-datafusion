@@ -1497,7 +1497,7 @@ mod tests {
         let memory_pool = ctx1.runtime_env().memory_pool.clone();
 
         let mut reservation = MemoryConsumer::new("test").register(&memory_pool);
-        reservation.grow(100);
+        reservation.grow("test", 100);
 
         let disk_manager = ctx1.runtime_env().disk_manager.clone();
 

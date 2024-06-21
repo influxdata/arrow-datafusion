@@ -504,7 +504,9 @@ impl ExecutionPlan for SymmetricHashJoinExec {
                 .register(context.memory_pool()),
         ));
         if let Some(g) = graph.as_ref() {
-            reservation.lock().try_grow(g.size())?;
+            reservation
+                .lock()
+                .try_grow("symmetric_hash_join::execute", g.size())?;
         }
 
         Ok(Box::pin(SymmetricHashJoinStream {
@@ -1529,7 +1531,11 @@ impl SymmetricHashJoinStream {
         let result = combine_two_batches(&self.schema, equal_result, anti_result)?;
         let capacity = self.size();
         self.metrics.stream_memory_usage.set(capacity);
-        self.reservation.lock().try_resize(capacity)?;
+        self.reservation.lock().try_resize(
+            "SymmetricHashJoinStream::perform_join_for_given_side",
+            capacity,
+        )?;
+
         // Update the metrics if we have a batch; otherwise, continue the loop.
         if let Some(batch) = &result {
             self.metrics.output_batches.add(1);

@@ -857,7 +857,10 @@ impl SMJStream {
                             if let Some(buffered_batch) =
                                 self.buffered_data.batches.pop_front()
                             {
-                                self.reservation.shrink(buffered_batch.size_estimation);
+                                self.reservation.shrink(
+                                    "sort_merge_join::SMJStream::poll_buffered_batches",
+                                    buffered_batch.size_estimation,
+                                );
                             }
                         } else {
                             break;
@@ -886,7 +889,10 @@ impl SMJStream {
                         if batch.num_rows() > 0 {
                             let buffered_batch =
                                 BufferedBatch::new(batch, 0..1, &self.on_buffered);
-                            self.reservation.try_grow(buffered_batch.size_estimation)?;
+                            self.reservation.try_grow(
+                                "sort_merge_join::SMJStream::poll_buffered_batches",
+                                buffered_batch.size_estimation,
+                            )?;
                             self.join_metrics
                                 .peak_mem_used
                                 .set_max(self.reservation.size());
@@ -933,7 +939,7 @@ impl SMJStream {
                                         &self.on_buffered,
                                     );
                                     self.reservation
-                                        .try_grow(buffered_batch.size_estimation)?;
+                                        .try_grow("sort_merge_join::SMJStream::poll_buffered_batches", buffered_batch.size_estimation)?;
                                     self.join_metrics
                                         .peak_mem_used
                                         .set_max(self.reservation.size());

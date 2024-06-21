@@ -234,7 +234,7 @@ mod tests {
         // update batch to work_table
         let array: ArrayRef = Arc::new((0..5).collect::<Int32Array>());
         let batch = RecordBatch::try_from_iter(vec![("col", array)]).unwrap();
-        reservation.try_grow(100).unwrap();
+        reservation.try_grow("test", 100).unwrap();
         work_table.update(ReservedBatches::new(vec![batch.clone()], reservation));
         // take from work_table
         let reserved_batches = work_table.take().unwrap();
