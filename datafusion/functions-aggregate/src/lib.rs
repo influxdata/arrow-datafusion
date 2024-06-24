@@ -61,13 +61,17 @@ pub mod covariance;
 pub mod first_last;
 pub mod hyperloglog;
 pub mod median;
+pub mod regr;
 pub mod stddev;
 pub mod sum;
 pub mod variance;
 
 pub mod approx_median;
 pub mod approx_percentile_cont;
+pub mod approx_percentile_cont_with_weight;
 
+use crate::approx_percentile_cont::approx_percentile_cont_udaf;
+use crate::approx_percentile_cont_with_weight::approx_percentile_cont_with_weight_udaf;
 use datafusion_common::Result;
 use datafusion_execution::FunctionRegistry;
 use datafusion_expr::AggregateUDF;
@@ -78,6 +82,8 @@ use std::sync::Arc;
 pub mod expr_fn {
     pub use super::approx_distinct;
     pub use super::approx_median::approx_median;
+    pub use super::approx_percentile_cont::approx_percentile_cont;
+    pub use super::approx_percentile_cont_with_weight::approx_percentile_cont_with_weight;
     pub use super::count::count;
     pub use super::count::count_distinct;
     pub use super::covariance::covar_pop;
@@ -85,6 +91,15 @@ pub mod expr_fn {
     pub use super::first_last::first_value;
     pub use super::first_last::last_value;
     pub use super::median::median;
+    pub use super::regr::regr_avgx;
+    pub use super::regr::regr_avgy;
+    pub use super::regr::regr_count;
+    pub use super::regr::regr_intercept;
+    pub use super::regr::regr_r2;
+    pub use super::regr::regr_slope;
+    pub use super::regr::regr_sxx;
+    pub use super::regr::regr_sxy;
+    pub use super::regr::regr_syy;
     pub use super::stddev::stddev;
     pub use super::stddev::stddev_pop;
     pub use super::sum::sum;
@@ -102,12 +117,23 @@ pub fn all_default_aggregate_functions() -> Vec<Arc<AggregateUDF>> {
         covariance::covar_pop_udaf(),
         median::median_udaf(),
         count::count_udaf(),
+        regr::regr_slope_udaf(),
+        regr::regr_intercept_udaf(),
+        regr::regr_count_udaf(),
+        regr::regr_r2_udaf(),
+        regr::regr_avgx_udaf(),
+        regr::regr_avgy_udaf(),
+        regr::regr_sxx_udaf(),
+        regr::regr_syy_udaf(),
+        regr::regr_sxy_udaf(),
         variance::var_samp_udaf(),
         variance::var_pop_udaf(),
         stddev::stddev_udaf(),
         stddev::stddev_pop_udaf(),
         approx_median::approx_median_udaf(),
         approx_distinct::approx_distinct_udaf(),
+        approx_percentile_cont_udaf(),
+        approx_percentile_cont_with_weight_udaf(),
     ]
 }
 

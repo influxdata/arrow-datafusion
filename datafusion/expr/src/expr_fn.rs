@@ -192,19 +192,6 @@ pub fn avg(expr: Expr) -> Expr {
     ))
 }
 
-/// Create an expression to represent the count() aggregate function
-// TODO: Remove this and use `expr_fn::count` instead
-pub fn count(expr: Expr) -> Expr {
-    Expr::AggregateFunction(AggregateFunction::new(
-        aggregate_function::AggregateFunction::Count,
-        vec![expr],
-        false,
-        None,
-        None,
-        None,
-    ))
-}
-
 /// Return a new expression with bitwise AND
 pub fn bitwise_and(left: Expr, right: Expr) -> Expr {
     Expr::BinaryExpr(BinaryExpr::new(
@@ -250,50 +237,9 @@ pub fn bitwise_shift_left(left: Expr, right: Expr) -> Expr {
     ))
 }
 
-/// Create an expression to represent the count(distinct) aggregate function
-// TODO: Remove this and use `expr_fn::count_distinct` instead
-pub fn count_distinct(expr: Expr) -> Expr {
-    Expr::AggregateFunction(AggregateFunction::new(
-        aggregate_function::AggregateFunction::Count,
-        vec![expr],
-        true,
-        None,
-        None,
-        None,
-    ))
-}
-
 /// Create an in_list expression
 pub fn in_list(expr: Expr, list: Vec<Expr>, negated: bool) -> Expr {
     Expr::InList(InList::new(Box::new(expr), list, negated))
-}
-
-/// Calculate an approximation of the specified `percentile` for `expr`.
-pub fn approx_percentile_cont(expr: Expr, percentile: Expr) -> Expr {
-    Expr::AggregateFunction(AggregateFunction::new(
-        aggregate_function::AggregateFunction::ApproxPercentileCont,
-        vec![expr, percentile],
-        false,
-        None,
-        None,
-        None,
-    ))
-}
-
-/// Calculate an approximation of the specified `percentile` for `expr` and `weight_expr`.
-pub fn approx_percentile_cont_with_weight(
-    expr: Expr,
-    weight_expr: Expr,
-    percentile: Expr,
-) -> Expr {
-    Expr::AggregateFunction(AggregateFunction::new(
-        aggregate_function::AggregateFunction::ApproxPercentileContWithWeight,
-        vec![expr, weight_expr, percentile],
-        false,
-        None,
-        None,
-        None,
-    ))
 }
 
 /// Create an EXISTS subquery expression
