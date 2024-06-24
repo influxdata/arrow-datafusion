@@ -110,7 +110,6 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
         match value {
             AggregateFunction::Min => Self::Min,
             AggregateFunction::Max => Self::Max,
-            AggregateFunction::Sum => Self::Sum,
             AggregateFunction::Avg => Self::Avg,
             AggregateFunction::BitAnd => Self::BitAnd,
             AggregateFunction::BitOr => Self::BitOr,
@@ -118,11 +117,7 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
             AggregateFunction::BoolAnd => Self::BoolAnd,
             AggregateFunction::BoolOr => Self::BoolOr,
             AggregateFunction::Count => Self::Count,
-            AggregateFunction::ApproxDistinct => Self::ApproxDistinct,
             AggregateFunction::ArrayAgg => Self::ArrayAgg,
-            AggregateFunction::VariancePop => Self::VariancePop,
-            AggregateFunction::Stddev => Self::Stddev,
-            AggregateFunction::StddevPop => Self::StddevPop,
             AggregateFunction::Correlation => Self::Correlation,
             AggregateFunction::RegrSlope => Self::RegrSlope,
             AggregateFunction::RegrIntercept => Self::RegrIntercept,
@@ -137,7 +132,6 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
             AggregateFunction::ApproxPercentileContWithWeight => {
                 Self::ApproxPercentileContWithWeight
             }
-            AggregateFunction::ApproxMedian => Self::ApproxMedian,
             AggregateFunction::Grouping => Self::Grouping,
             AggregateFunction::NthValue => Self::NthValueAgg,
             AggregateFunction::StringAgg => Self::StringAgg,
@@ -397,9 +391,6 @@ pub fn serialize_expr(
         }) => match func_def {
             AggregateFunctionDefinition::BuiltIn(fun) => {
                 let aggr_function = match fun {
-                    AggregateFunction::ApproxDistinct => {
-                        protobuf::AggregateFunction::ApproxDistinct
-                    }
                     AggregateFunction::ApproxPercentileCont => {
                         protobuf::AggregateFunction::ApproxPercentileCont
                     }
@@ -409,7 +400,6 @@ pub fn serialize_expr(
                     AggregateFunction::ArrayAgg => protobuf::AggregateFunction::ArrayAgg,
                     AggregateFunction::Min => protobuf::AggregateFunction::Min,
                     AggregateFunction::Max => protobuf::AggregateFunction::Max,
-                    AggregateFunction::Sum => protobuf::AggregateFunction::Sum,
                     AggregateFunction::BitAnd => protobuf::AggregateFunction::BitAnd,
                     AggregateFunction::BitOr => protobuf::AggregateFunction::BitOr,
                     AggregateFunction::BitXor => protobuf::AggregateFunction::BitXor,
@@ -417,13 +407,6 @@ pub fn serialize_expr(
                     AggregateFunction::BoolOr => protobuf::AggregateFunction::BoolOr,
                     AggregateFunction::Avg => protobuf::AggregateFunction::Avg,
                     AggregateFunction::Count => protobuf::AggregateFunction::Count,
-                    AggregateFunction::VariancePop => {
-                        protobuf::AggregateFunction::VariancePop
-                    }
-                    AggregateFunction::Stddev => protobuf::AggregateFunction::Stddev,
-                    AggregateFunction::StddevPop => {
-                        protobuf::AggregateFunction::StddevPop
-                    }
                     AggregateFunction::Correlation => {
                         protobuf::AggregateFunction::Correlation
                     }
@@ -442,9 +425,6 @@ pub fn serialize_expr(
                     AggregateFunction::RegrSXX => protobuf::AggregateFunction::RegrSxx,
                     AggregateFunction::RegrSYY => protobuf::AggregateFunction::RegrSyy,
                     AggregateFunction::RegrSXY => protobuf::AggregateFunction::RegrSxy,
-                    AggregateFunction::ApproxMedian => {
-                        protobuf::AggregateFunction::ApproxMedian
-                    }
                     AggregateFunction::Grouping => protobuf::AggregateFunction::Grouping,
                     AggregateFunction::NthValue => {
                         protobuf::AggregateFunction::NthValueAgg
