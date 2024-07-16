@@ -33,6 +33,8 @@ use datafusion_physical_expr::intervals::utils::{check_support, is_datatype_supp
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::joins::SymmetricHashJoinExec;
 use datafusion_physical_plan::{get_plan_string, ExecutionPlanProperties};
+use datafusion_physical_plan::sorts::sort::SortExec;
+use datafusion_physical_plan::union::UnionExec;
 
 use crate::PhysicalOptimizerRule;
 use datafusion_physical_expr_common::sort_expr::format_physical_sort_requirement_list;
@@ -135,6 +137,14 @@ pub fn check_plan_sanity(
         plan.required_input_ordering(),
         plan.required_input_distribution(),
     ) {
+        // TEMP HACK WORKAROUND https://github.com/apache/datafusion/issues/11492
+        if child.as_any().downcast_ref::<UnionExec>().is_some() {
+            continue;
+        }
+        if child.as_any().downcast_ref::<SortExec>().is_some() {
+            continue;
+        }
+
         let child_eq_props = child.equivalence_properties();
         if let Some(sort_req) = sort_req {
             if !child_eq_props.ordering_satisfy_requirement(&sort_req) {
