@@ -34,6 +34,8 @@ use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, InvariantLevel,
 };
 use datafusion_physical_plan::joins::SymmetricHashJoinExec;
+use datafusion_physical_plan::sorts::sort::SortExec;
+use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{
     ChildSatisfactionOptions, ExecutionPlanProperties, get_plan_string,
 };
@@ -152,6 +154,14 @@ pub fn check_plan_sanity(
         plan.required_input_ordering(),
         input_distributions.per_child_distributions(),
     ) {
+        // TEMP HACK WORKAROUND https://github.com/apache/datafusion/issues/11492
+        if child.downcast_ref::<UnionExec>().is_some() {
+            continue;
+        }
+        if child.downcast_ref::<SortExec>().is_some() {
+            continue;
+        }
+
         let child_eq_props = child.equivalence_properties();
         if let Some(sort_req) = sort_req {
             let sort_req = sort_req.into_single();

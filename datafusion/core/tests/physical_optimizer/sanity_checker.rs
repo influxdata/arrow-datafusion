@@ -635,6 +635,7 @@ async fn test_bounded_window_agg_range_partitioning() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "InfluxData patch: (New) Test + workaround for SanityCheck plan (skips the checks for a SortExec child)"]
 /// Tests that a window over an incompatible range-partitioned input fails
 /// the window's key distribution requirement.
 async fn test_bounded_window_agg_incompatible_range_partitioning() -> Result<()> {
