@@ -466,6 +466,9 @@ physical_plan
 ########
 
 statement ok
+drop table t
+
+statement ok
 drop table t1;
 
 statement ok
@@ -677,3 +680,49 @@ DROP TABLE t3;
 
 statement ok
 DROP TABLE t4;
+
+# Test issue: https://github.com/apache/datafusion/issues/11742
+query R rowsort
+WITH 
+  tt(v1) AS (VALUES (1::INT),(NULL::INT)) 
+SELECT NVL(v1, 0.5) FROM tt
+  UNION ALL
+SELECT NULL WHERE FALSE;
+----
+0.5
+1
+
+
+###
+# Test for https://github.com/apache/datafusion/issues/11492
+###
+
+# Input data is
+# a,b,c
+# 1,2,3
+
+statement ok
+CREATE EXTERNAL TABLE t (
+  a INT,
+  b INT,
+  c INT
+)
+STORED AS CSV
+LOCATION '../core/tests/data/example.csv'
+WITH ORDER (a ASC)
+OPTIONS ('format.has_header' 'true');
+
+query T
+SELECT (SELECT a from t ORDER BY a) UNION ALL (SELECT 'bar' as a from t) ORDER BY a;
+----
+1
+bar
+
+query I
+SELECT (SELECT a from t ORDER BY a) UNION ALL (SELECT NULL as a from t) ORDER BY a;
+----
+1
+NULL 
+
+statement ok
+drop table t
