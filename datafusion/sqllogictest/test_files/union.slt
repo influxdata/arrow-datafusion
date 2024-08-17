@@ -648,3 +648,172 @@ DROP TABLE t1;
 
 statement ok
 DROP TABLE t2;
+
+
+
+
+
+
+# Test issue: TBD
+statement ok
+CREATE TABLE t1(v0 BIGINT, v1 BIGINT, v2 BIGINT, v3 BOOLEAN);
+
+statement ok
+CREATE TABLE t2(v0 DOUBLE, v4 BOOLEAN, v5 BIGINT, v6 BIGINT);
+
+query I
+INSERT INTO t1(v0, v2, v1) VALUES (-1229445667, -342312412, -1507138076);
+----
+1
+
+query I
+INSERT INTO t1(v0, v1) VALUES (1541512604, -1229445667);
+----
+1
+
+query I
+INSERT INTO t1(v1, v3, v0, v2) VALUES (-1020641465, false, -1493773377, 1751276473);
+----
+1
+
+query I
+INSERT INTO t1(v3) VALUES (true), (true), (false);
+----
+3
+
+query I
+INSERT INTO t2(v0, v6) VALUES (0.28014577292925047, 1751276473);
+----
+1
+
+query I
+INSERT INTO t2(v0, v4, v5) VALUES (0.28014577292925047, false, 1751276473);
+----
+1
+
+
+# test UNION ALL, with gap filling (nulls), with different sorts on incoming streams
+query TT
+explain SELECT v0, v2, v3 as v4, null as v5 FROM t1  -- numeric, numeric, boolean, nulls filled 
+    UNION ALL
+SELECT v0, null as v2, v4, v5 FROM t2   -- numeric, nulls filled, boolean, numeric
+ORDER BY v2, v4, v0 -- sort by: only on t1, only on t2, on both
+----
+logical_plan
+01)Sort: t1.v2 ASC NULLS LAST, v4 ASC NULLS LAST, t1.v0 ASC NULLS LAST
+02)--Union
+03)----Projection: CAST(t1.v0 AS Float64) AS v0, t1.v2, t1.v3 AS v4, Int64(NULL) AS v5
+04)------TableScan: t1 projection=[v0, v2, v3]
+05)----Projection: t2.v0, Int64(NULL) AS v2, t2.v4, t2.v5
+06)------TableScan: t2 projection=[v0, v4, v5]
+physical_plan
+01)SortPreservingMergeExec: [v2@1 ASC NULLS LAST,v4@2 ASC NULLS LAST,v0@0 ASC NULLS LAST]
+02)--UnionExec
+03)----SortExec: expr=[v2@1 ASC NULLS LAST,v4@2 ASC NULLS LAST,v0@0 ASC NULLS LAST], preserve_partitioning=[true]
+04)------ProjectionExec: expr=[CAST(v0@0 AS Float64) as v0, v2@1 as v2, v3@2 as v4, NULL as v5]
+05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+06)----------MemoryExec: partitions=1, partition_sizes=[4]
+07)----SortExec: expr=[v4@2 ASC NULLS LAST,v0@0 ASC NULLS LAST], preserve_partitioning=[false]
+08)------ProjectionExec: expr=[v0@0 as v0, NULL as v2, v4@1 as v4, v5@2 as v5]
+09)--------MemoryExec: partitions=1, partition_sizes=[2]
+
+# it should run
+query RIBI
+SELECT v0, v2, v3 as v4, null as v5 FROM t1  -- numeric, numeric, boolean, nulls filled 
+    UNION ALL
+SELECT v0, null as v2, v4, v5 FROM t2   -- numeric, nulls filled, boolean, numeric
+ORDER BY v2, v4, v0 -- sort by: only on t1, only on t2, on both
+----
+-1229445667 -342312412 NULL NULL
+-1493773377 1751276473 false NULL
+0.280145772929 NULL false 1751276473
+NULL NULL false NULL
+NULL NULL true NULL
+NULL NULL true NULL
+0.280145772929 NULL NULL NULL
+1541512604 NULL NULL NULL
+
+
+
+# test -- same as above, except use a later column index (on t2) as the first projection
+query TT
+explain SELECT v0, v2, v3 as v4, null as v5 FROM t1  -- numeric, numeric, boolean, nulls filled 
+    UNION ALL
+SELECT v6, null as v2, v4, v5 FROM t2   -- numeric, nulls filled, boolean, numeric
+ORDER BY v2, v4, v0 -- sort by: only on t1, only on t2, on both
+----
+logical_plan
+01)Sort: t1.v2 ASC NULLS LAST, v4 ASC NULLS LAST, t1.v0 ASC NULLS LAST
+02)--Union
+03)----Projection: t1.v0, t1.v2, t1.v3 AS v4, Int64(NULL) AS v5
+04)------TableScan: t1 projection=[v0, v2, v3]
+05)----Projection: t2.v6 AS v0, Int64(NULL) AS v2, t2.v4, t2.v5
+06)------TableScan: t2 projection=[v4, v5, v6]
+physical_plan
+01)SortPreservingMergeExec: [v2@1 ASC NULLS LAST,v4@2 ASC NULLS LAST,v0@0 ASC NULLS LAST]
+02)--UnionExec
+03)----SortExec: expr=[v2@1 ASC NULLS LAST,v4@2 ASC NULLS LAST,v0@0 ASC NULLS LAST], preserve_partitioning=[false]
+04)------ProjectionExec: expr=[v0@0 as v0, v2@1 as v2, v3@2 as v4, NULL as v5]
+05)--------MemoryExec: partitions=1, partition_sizes=[4]
+06)----SortExec: expr=[v4@2 ASC NULLS LAST,v0@0 ASC NULLS LAST], preserve_partitioning=[false]
+07)------ProjectionExec: expr=[v6@2 as v0, NULL as v2, v4@0 as v4, v5@1 as v5]
+08)--------MemoryExec: partitions=1, partition_sizes=[2]
+
+# run it
+query IIBI
+SELECT v0, v2, v3 as v4, null as v5 FROM t1  -- numeric, numeric, boolean, nulls filled 
+    UNION ALL
+SELECT v6, null as v2, v4, v5 FROM t2   -- numeric, nulls filled, boolean, numeric
+ORDER BY v2, v4, v0 -- sort by: only on t1, only on t2, on both
+----
+-1229445667 -342312412 NULL NULL
+-1493773377 1751276473 false NULL
+NULL NULL false NULL
+NULL NULL false 1751276473
+NULL NULL true NULL
+NULL NULL true NULL
+1541512604 NULL NULL NULL
+1751276473 NULL NULL NULL
+
+
+# test -- same as above, but remove the order by clause
+query TT
+explain SELECT v0, v2, v3 as v4, null as v5 FROM t1  -- numeric, numeric, boolean, nulls filled 
+    UNION ALL
+SELECT v6, null as v2, v4, v5 FROM t2   -- numeric, nulls filled, boolean, numeric
+----
+logical_plan
+01)Union
+02)--Projection: t1.v0, t1.v2, t1.v3 AS v4, Int64(NULL) AS v5
+03)----TableScan: t1 projection=[v0, v2, v3]
+04)--Projection: t2.v6 AS v0, Int64(NULL) AS v2, t2.v4, t2.v5
+05)----TableScan: t2 projection=[v4, v5, v6]
+physical_plan
+01)UnionExec
+02)--ProjectionExec: expr=[v0@0 as v0, v2@1 as v2, v3@2 as v4, NULL as v5]
+03)----MemoryExec: partitions=1, partition_sizes=[4]
+04)--ProjectionExec: expr=[v6@2 as v0, NULL as v2, v4@0 as v4, v5@1 as v5]
+05)----MemoryExec: partitions=1, partition_sizes=[2]
+
+# run it
+query IIBI
+SELECT v0, v2, v3 as v4, null as v5 FROM t1  -- numeric, numeric, boolean, nulls filled 
+    UNION ALL
+SELECT v6, null as v2, v4, v5 FROM t2   -- numeric, nulls filled, boolean, numeric
+----
+1751276473 NULL NULL NULL
+NULL NULL false 1751276473
+-1229445667 -342312412 NULL NULL
+1541512604 NULL NULL NULL
+-1493773377 1751276473 false NULL
+NULL NULL true NULL
+NULL NULL true NULL
+NULL NULL false NULL
+
+
+statement ok
+DROP TABLE t1;
+
+statement ok
+DROP TABLE t2;
+
