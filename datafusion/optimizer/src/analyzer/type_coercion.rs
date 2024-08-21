@@ -902,16 +902,14 @@ mod test {
     use arrow::datatypes::DataType::Utf8;
     use arrow::datatypes::{DataType, Field, TimeUnit};
 
+    use arrow_schema::{Fields, Schema};
     use datafusion_common::tree_node::{TransformedResult, TreeNode};
     use datafusion_common::{DFSchema, DFSchemaRef, Result, ScalarValue};
     use datafusion_expr::expr::{self, InSubquery, Like, ScalarFunction};
     use datafusion_expr::logical_plan::{EmptyRelation, Projection};
     use datafusion_expr::test::function_stub::avg_udaf;
     use datafusion_expr::{
-        cast, col, create_udaf, is_true, lit, AccumulatorFactoryFunction, AggregateUDF,
-        BinaryExpr, Case, ColumnarValue, Expr, ExprSchemable, Filter, LogicalPlan,
-        Operator, ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF, Subquery,
-        Volatility,
+        cast, col, create_udaf, is_true, lit, table_scan, AccumulatorFactoryFunction, AggregateUDF, BinaryExpr, Case, ColumnarValue, Expr, ExprSchemable, Filter, LogicalPlan, Operator, ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF, Subquery, Volatility
     };
     use datafusion_functions_aggregate::average::AvgAccumulator;
 
@@ -919,6 +917,8 @@ mod test {
         coerce_case_expression, TypeCoercion, TypeCoercionRewriter,
     };
     use crate::test::assert_analyzed_plan_eq;
+
+    use super::coerce_union_schema;
 
     fn empty() -> Arc<LogicalPlan> {
         Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
@@ -1174,6 +1174,80 @@ mod test {
         }));
         let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
         let expected = "Projection: CAST(a AS Decimal128(24, 4)) IN ([CAST(Int32(1) AS Decimal128(24, 4)), CAST(Int8(4) AS Decimal128(24, 4)), CAST(Int64(8) AS Decimal128(24, 4))])\n  EmptyRelation";
+        assert_analyzed_plan_eq(Arc::new(TypeCoercion::new()), plan, expected)
+    }
+
+    #[test]
+    fn union_with_nulls() -> Result<()> {
+        let schema1 = Schema::new(vec![
+            Field::new("time", DataType::UInt64, false),
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Null, true),
+        ]);
+        let schema2 = Schema::new(vec![
+            Field::new("time", DataType::UInt64, false),
+            Field::new("a", DataType::Null, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+
+        let plan1 = table_scan(Some("has_a"), &schema1, Some(vec![0, 1, 2]))?;
+        let plan2 = table_scan(Some("has_b"), &schema2, Some(vec![0, 1, 2]))?;
+        // use the union() from datafusion-expr
+        let plan = plan1.union(plan2.build()?)?.build()?;
+        let LogicalPlan::Union(union) = plan.clone() else { unreachable!() };
+
+        let union_schema = coerce_union_schema(&union.inputs);
+        let expected_fields = Fields::from(vec![
+            Field::new("time", DataType::UInt64, false),
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        assert_eq!(&expected_fields, union_schema.unwrap().fields(), "coerce_union_schema should determine proper input field types");
+
+        let expected =
+            "Union\
+            \n  Projection: has_a.time, has_a.a, CAST(has_a.b AS Int32) AS b\
+            \n    TableScan: has_a projection=[time, a, b]\
+            \n  Projection: has_b.time, CAST(has_b.a AS Int32) AS a, has_b.b\
+            \n    TableScan: has_b projection=[time, a, b]";
+        assert_analyzed_plan_eq(Arc::new(TypeCoercion::new()), plan, expected)
+    }
+
+    #[test]
+    fn union_with_scaler_nulls() -> Result<()> {
+        let schema1 = Schema::new(vec![
+            Field::new("time", DataType::UInt64, false),
+            Field::new("a", DataType::Int32, true),
+        ]);
+        let schema2 = Schema::new(vec![
+            Field::new("time", DataType::UInt64, false),
+            Field::new("b", DataType::Int32, true),
+        ]);
+
+        let plan1 = table_scan(Some("has_a"), &schema1, Some(vec![0, 1]))?
+            .project(vec![col("time"), col("a"), lit(ScalarValue::Null).alias("b")])?;
+
+        let plan2 = table_scan(Some("has_b"), &schema2, Some(vec![0, 1]))?
+            .project(vec![col("time"), lit(ScalarValue::Null).alias("a"), col("b")])?;
+
+        // use the union() from datafusion-expr
+        let plan = plan1.union(plan2.build()?)?.build()?;
+        let LogicalPlan::Union(union) = plan.clone() else { unreachable!() };
+
+        let union_schema = coerce_union_schema(&union.inputs);
+        let expected_fields = Fields::from(vec![
+            Field::new("time", DataType::UInt64, false),
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        assert_eq!(&expected_fields, union_schema.unwrap().fields(), "coerce_union_schema should determine proper input field types");
+
+        let expected =
+            "Union\
+            \n  Projection: has_a.time, has_a.a, CAST(NULL AS Int32) AS b\
+            \n    TableScan: has_a projection=[time, a]\
+            \n  Projection: has_b.time, CAST(NULL AS Int32) AS a, has_b.b\
+            \n    TableScan: has_b projection=[time, b]";
         assert_analyzed_plan_eq(Arc::new(TypeCoercion::new()), plan, expected)
     }
 

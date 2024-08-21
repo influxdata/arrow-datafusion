@@ -1744,6 +1744,40 @@ mod tests {
     }
 
     #[test]
+    fn plan_builder_union_with_nulls() -> Result<()> {
+        let schema1 = Schema::new(vec![
+            Field::new("time", DataType::UInt64, false),
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Null, true),
+        ]);
+        let schema2 = Schema::new(vec![
+            Field::new("time", DataType::UInt64, false),
+            Field::new("a", DataType::Null, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+
+        let plan1 = table_scan(Some("has_a"), &schema1, Some(vec![0, 1, 2]))?;
+        let plan2 = table_scan(Some("has_b"), &schema2, Some(vec![0, 1, 2]))?;
+
+        let plan = plan1.union(plan2.build()?)?.build()?;
+
+        // get expected plan
+        let expected = "Union\
+        \n  TableScan: has_a projection=[time, a, b]\
+        \n  TableScan: has_b projection=[time, a, b]";
+        assert_eq!(expected, format!("{plan}"));
+
+        // output schema from union
+        assert_eq!(
+            &Arc::new(schema1.clone()),
+            plan.schema().inner(),
+            "output schema should be the left schema (relies on type coersion later)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn plan_builder_union_distinct() -> Result<()> {
         let plan =
             table_scan(Some("employee_csv"), &employee_schema(), Some(vec![3, 4]))?;

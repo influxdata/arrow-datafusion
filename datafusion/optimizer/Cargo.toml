@@ -55,6 +55,7 @@ regex-syntax = "0.8.0"
 
 [dev-dependencies]
 arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
 ctor = { workspace = true }
 datafusion-functions-aggregate = { workspace = true }
 datafusion-sql = { workspace = true }
