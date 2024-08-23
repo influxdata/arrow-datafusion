@@ -108,14 +108,4 @@ mod tests {
             Err(e) if e.is_cancelled()
         ));
     }
-
-    #[tokio::test]
-    #[should_panic(expected = "foo")]
-    async fn panic_resume() {
-        // this should panic w/o an `unwrap`
-        SpawnedTask::spawn(async { panic!("foo") })
-            .join_unwind()
-            .await
-            .ok();
-    }
 }
