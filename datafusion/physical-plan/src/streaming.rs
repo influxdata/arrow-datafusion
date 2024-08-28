@@ -217,10 +217,6 @@ impl ExecutionPlan for StreamingTableExec {
         &self.cache
     }
 
-    fn fetch(&self) -> Option<usize> {
-        self.limit
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
