@@ -122,7 +122,7 @@ indexmap = "2.0.0"
 itertools = "0.13"
 log = "^0.4"
 num_cpus = "1.13.0"
-object_store = { version = "0.10.2", default-features = false }
+object_store = { version = "0.11.0", default-features = false }
 parking_lot = "0.12"
 parquet = { version = "52.2.0", default-features = false, features = [
     "arrow",
@@ -164,3 +164,19 @@ large_futures = "warn"
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tarpaulin)"] }
 unused_imports = "deny"
+
+## Temporary arrow-rs patch until 53.0.0 is released
+
+[patch.crates-io]
+arrow = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-array = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-buffer = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-cast = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-data = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-ipc = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-schema = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-select = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-string = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-ord = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+arrow-flight = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
+parquet = { git = "https://github.com/apache/arrow-rs.git", rev = "344ba1dd870cb8c7327a08a7020a0350d4afd687" }
