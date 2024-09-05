@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use chrono::Utc;
 use datafusion_common::{resources_datafusion_err, DataFusionError, Result};
 use hashbrown::HashMap;
 use log::debug;
@@ -301,7 +302,8 @@ impl<I: MemoryPool> TrackConsumersPool<I> {
                 )
             })
             .collect::<Vec<_>>();
-        consumers.sort_by(|a, b| b.1.cmp(&a.1)); // inverse ordering
+        // consumers.sort_by(|a, b| b.1.cmp(&a.1)); // inverse ordering
+        consumers.sort_by(|a, b| b.0.cmp(&a.0)); // sort by name, make stdout easily parsible
 
         consumers[0..std::cmp::min(top, consumers.len())]
             .iter()
@@ -346,6 +348,8 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
             .and_modify(|bytes| {
                 bytes.fetch_add(additional as u64, Ordering::AcqRel);
             });
+
+        println!("REPORT: {}, {}", Utc::now(), self.report_top(5));
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
@@ -380,6 +384,8 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
             .and_modify(|bytes| {
                 bytes.fetch_add(additional as u64, Ordering::AcqRel);
             });
+        println!("REPORT: {}, {}", Utc::now(), self.report_top(5));
+
         Ok(())
     }
 
