@@ -48,4 +48,5 @@ object_store = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true }
 url = { workspace = true }
