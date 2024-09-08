@@ -693,6 +693,9 @@ pub fn transpose<T>(original: Vec<Vec<T>>) -> Vec<Vec<T>> {
 /// Computes the `skip` and `fetch` parameters of a single limit that would be
 /// equivalent to two consecutive limits with the given `skip`/`fetch` parameters.
 ///
+/// This function assumes that the child skip is applied first, then the child fetch occurs at the
+/// same time as the parent skip.
+///
 /// There are multiple cases to consider:
 ///
 /// # Case 0: Parent and child are disjoint (`child_fetch <= skip`).
