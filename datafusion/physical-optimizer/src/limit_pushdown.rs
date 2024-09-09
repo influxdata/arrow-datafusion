@@ -160,7 +160,6 @@ pub fn pushdown_limit_helper(
     // If we have a non-limit operator with fetch capability, update global
     // state as necessary:
     if pushdown_plan.fetch().is_some() {
-
         // if global_state.fetch.is_none(), then there were no LimitExecs on top of the
         // pushdown_plan, so we can safely assume that whatever this plan has set as its `fetch`
         // value is already what we need, so the requirements are satisfied.
@@ -181,11 +180,7 @@ pub fn pushdown_limit_helper(
         return if global_state.skip > 0 && !global_state.satisfied {
             // There might be a case with only offset, if so add a global limit:
             global_state.satisfied = true;
-            Transformed::yes(add_global_limit(
-                pushdown_plan,
-                global_state.skip,
-                None,
-            ))
+            Transformed::yes(add_global_limit(pushdown_plan, global_state.skip, None))
         } else {
             // There's no info on offset or fetch, nothing to do:
             Transformed::no(pushdown_plan)
@@ -198,10 +193,10 @@ pub fn pushdown_limit_helper(
         if !combines_input_partitions(&pushdown_plan) {
             // We have information in the global state and the plan pushes down,
             // continue:
-            return Transformed::no(pushdown_plan)
+            return Transformed::no(pushdown_plan);
         } else if global_state.satisfied {
             // If the plan is already satisfied, do not add a limit:
-            return Transformed::no(pushdown_plan)
+            return Transformed::no(pushdown_plan);
         }
 
         if global_state.skip == 0 {
@@ -210,16 +205,12 @@ pub fn pushdown_limit_helper(
                 // fetch info to plan if possible. If not, we must add a `LimitExec`
                 // with the information from the global state.
                 global_state.satisfied = true;
-                return Transformed::yes(plan_with_fetch)
+                return Transformed::yes(plan_with_fetch);
             }
         }
 
         global_state.satisfied = true;
-        Transformed::yes(add_limit(
-            pushdown_plan,
-            global_state.skip,
-            global_fetch,
-        ))
+        Transformed::yes(add_limit(pushdown_plan, global_state.skip, global_fetch))
     } else {
         // The plan does not support push down and it is not a limit. We will need
         // to add a limit or a fetch. If the plan is already satisfied, we will try
