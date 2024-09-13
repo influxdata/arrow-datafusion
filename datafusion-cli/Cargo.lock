@@ -1268,6 +1268,7 @@ dependencies = [
  "parking_lot",
  "rand",
  "tempfile",
+ "tokio",
  "url",
 ]
 

@@ -23,7 +23,10 @@ use log::debug;
 use parking_lot::Mutex;
 use std::{
     num::NonZeroUsize,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 /// A [`MemoryPool`] that enforces no limit
@@ -262,7 +265,7 @@ fn insufficient_capacity_err(
 pub struct TrackConsumersPool<I> {
     inner: I,
     top: NonZeroUsize,
-    tracked_consumers: Mutex<HashMap<MemoryConsumer, AtomicU64>>,
+    tracked_consumers: Arc<Mutex<HashMap<MemoryConsumer, AtomicU64>>>,
 }
 
 impl<I: MemoryPool> TrackConsumersPool<I> {
@@ -271,10 +274,31 @@ impl<I: MemoryPool> TrackConsumersPool<I> {
     /// The `top` determines how many Top K [`MemoryConsumer`]s to include
     /// in the reported [`DataFusionError::ResourcesExhausted`].
     pub fn new(inner: I, top: NonZeroUsize) -> Self {
+        let tracked_consumers = Default::default();
+
+        let _captured: Arc<
+            parking_lot::lock_api::Mutex<
+                parking_lot::RawMutex,
+                HashMap<MemoryConsumer, AtomicU64>,
+            >,
+        > = Arc::clone(&tracked_consumers);
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                println!(
+                    "REPORT: {}, {}",
+                    Utc::now(),
+                    Self::_report_top(5, Arc::clone(&_captured))
+                );
+            }
+        });
+
         Self {
             inner,
             top,
-            tracked_consumers: Default::default(),
+            tracked_consumers,
         }
     }
 
@@ -282,17 +306,21 @@ impl<I: MemoryPool> TrackConsumersPool<I> {
     /// which have the same name.
     ///
     /// This is very tied to the implementation of the memory consumer.
-    fn has_multiple_consumers(&self, name: &String) -> bool {
+    fn has_multiple_consumers(
+        name: &String,
+        tracked_consumers: &Arc<Mutex<HashMap<MemoryConsumer, AtomicU64>>>,
+    ) -> bool {
         let consumer = MemoryConsumer::new(name);
         let consumer_with_spill = consumer.clone().with_can_spill(true);
-        let guard = self.tracked_consumers.lock();
+        let guard = tracked_consumers.lock();
         guard.contains_key(&consumer) && guard.contains_key(&consumer_with_spill)
     }
 
-    /// The top consumers in a report string.
-    pub fn report_top(&self, top: usize) -> String {
-        let mut consumers = self
-            .tracked_consumers
+    fn _report_top(
+        top: usize,
+        tracked_consumers: Arc<Mutex<HashMap<MemoryConsumer, AtomicU64>>>,
+    ) -> String {
+        let mut consumers = tracked_consumers
             .lock()
             .iter()
             .map(|(consumer, reserved)| {
@@ -308,7 +336,7 @@ impl<I: MemoryPool> TrackConsumersPool<I> {
         consumers[0..std::cmp::min(top, consumers.len())]
             .iter()
             .map(|((name, can_spill), size)| {
-                if self.has_multiple_consumers(name) {
+                if Self::has_multiple_consumers(name, &tracked_consumers) {
                     format!("{name}(can_spill={}) consumed {:?} bytes", can_spill, size)
                 } else {
                     format!("{name} consumed {:?} bytes", size)
@@ -316,6 +344,11 @@ impl<I: MemoryPool> TrackConsumersPool<I> {
             })
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// The top consumers in a report string.
+    pub fn report_top(&self, top: usize) -> String {
+        Self::_report_top(top, Arc::clone(&self.tracked_consumers))
     }
 }
 
@@ -348,8 +381,6 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
             .and_modify(|bytes| {
                 bytes.fetch_add(additional as u64, Ordering::AcqRel);
             });
-
-        println!("REPORT: {}, {}", Utc::now(), self.report_top(5));
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
@@ -384,7 +415,6 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
             .and_modify(|bytes| {
                 bytes.fetch_add(additional as u64, Ordering::AcqRel);
             });
-        println!("REPORT: {}, {}", Utc::now(), self.report_top(5));
 
         Ok(())
     }
