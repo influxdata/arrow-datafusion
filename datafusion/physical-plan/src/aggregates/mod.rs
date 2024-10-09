@@ -2067,7 +2067,8 @@ mod tests {
                         use_coalesce_batches,
                         is_first_acc,
                         spill,
-                        4200,
+                        // increase memory to account for nullable array
+                        4300,
                     )
                     .await?
                 }
@@ -2755,7 +2756,7 @@ mod tests {
             Field::new("a", DataType::Float32, false),
             Field::new("b", DataType::Float32, true),
             Field::new("__grouping_id", DataType::UInt8, false),
-            Field::new("COUNT(a)", DataType::Int64, false),
+            Field::new("COUNT(a)", DataType::Int64, true),
         ]);
         assert_eq!(aggr_schema, expected_schema);
         Ok(())
