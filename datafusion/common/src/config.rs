@@ -389,7 +389,7 @@ config_namespace! {
         ///
         /// This is used to workaround bugs in the planner that are now caught by
         /// the new schema verification step.
-        pub skip_physical_aggregate_schema_check: bool, default = false
+        pub skip_physical_aggregate_schema_check: bool, default = true
 
         /// Sets the compression codec used when spilling data to disk.
         ///
