@@ -692,6 +692,9 @@ impl DefaultPhysicalPlanner {
                             differences.push(format!("field nullability at index {} [{}]: (physical) {} vs (logical) {}", i, physical_field.name(), physical_field.is_nullable(), logical_field.is_nullable()));
                         }
                     }
+
+                    log::warn!("Physical input schema should be the same as the one converted from logical input schema, but did not match for logical plan:\n{}", input.display_indent());
+
                     return internal_err!("Physical input schema should be the same as the one converted from logical input schema. Differences: {}", differences
                         .iter()
                         .map(|s| format!("\n\t- {}", s))
