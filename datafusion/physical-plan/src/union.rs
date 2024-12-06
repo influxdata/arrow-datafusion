@@ -468,16 +468,30 @@ pub fn can_interleave<T: Borrow<Arc<dyn ExecutionPlan>>>(
 }
 
 fn union_schema(inputs: &[Arc<dyn ExecutionPlan>]) -> SchemaRef {
-    let fields: Vec<Field> = (0..inputs[0].schema().fields().len())
+    let fields: Vec<Field> = (0..std::cmp::max(
+        inputs[0].schema().fields().len(),
+        inputs
+            .get(1)
+            .map(|l| l.schema().fields().len())
+            .unwrap_or_default(),
+    ))
         .map(|i| {
             inputs
                 .iter()
-                .filter_map(|input| {
-                    if input.schema().fields().len() > i {
-                        Some(input.schema().field(i).clone())
-                    } else {
-                        None
-                    }
+                .enumerate()
+                .filter_map(|(input_idx, input)| {
+                    let field = input.schema().field(i).clone();
+                    let mut metadata = field.metadata().clone();
+
+                    let other_side_metdata = inputs
+                        .get(input_idx ^ (1 << 0))
+                        .map(|other_input| {
+                            other_input.schema().field(i).metadata().clone()
+                        })
+                        .unwrap_or_default();
+
+                    metadata.extend(other_side_metdata);
+                    Some(field.with_metadata(metadata))
                 })
                 .find_or_first(|f| f.is_nullable())
                 .unwrap()
