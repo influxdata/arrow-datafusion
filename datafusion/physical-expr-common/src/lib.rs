@@ -23,6 +23,12 @@
 //!
 //! [DataFusion]: <https://crates.io/crates/datafusion>
 
+// Disable clippy lints that were introduced after this code was written
+#![allow(clippy::needless_return)]
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
+#![allow(clippy::empty_line_after_doc_comments)]
+
 pub mod binary_map;
 pub mod binary_view_map;
 pub mod datum;
