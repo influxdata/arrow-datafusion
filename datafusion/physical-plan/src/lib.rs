@@ -18,6 +18,14 @@
 // Make cheap clones clear: https://github.com/apache/datafusion/issues/11143
 
 #![deny(clippy::clone_on_ref_ptr)]
+// Disable clippy lints that were introduced after this code was written
+#![allow(clippy::needless_return)]
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
+#![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::unnecessary_filter_map)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::unnecessary_first_then_check)]
 
 //! Traits for physical query plan, supporting parallel execution for partitioned relations.
 //!
