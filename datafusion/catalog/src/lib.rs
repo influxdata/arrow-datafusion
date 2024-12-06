@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Disable clippy lints that were introduced after this code was written
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
+#![allow(clippy::empty_line_after_doc_comments)]
+
 mod catalog;
 mod dynamic_file;
 mod schema;

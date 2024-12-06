@@ -24,6 +24,11 @@
 
 // Make cheap clones clear: https://github.com/apache/datafusion/issues/11143
 #![deny(clippy::clone_on_ref_ptr)]
+// Disable clippy lints that were introduced after this code was written
+#![allow(clippy::needless_return)]
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
+#![allow(clippy::empty_line_after_doc_comments)]
 
 pub mod accumulator;
 pub mod aggregate;
