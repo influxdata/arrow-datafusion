@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Disable clippy lints that were introduced after this code was written
+#![allow(clippy::needless_return)]
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
+#![allow(clippy::empty_line_after_doc_comments)]
+
 //! Logical Expr types and traits for [DataFusion]
 //!
 //! This crate contains types and traits that are used by both Logical and Physical expressions.
