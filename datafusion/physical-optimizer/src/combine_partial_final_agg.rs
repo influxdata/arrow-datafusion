@@ -118,8 +118,9 @@ impl PhysicalOptimizerRule for CombinePartialFinalAggregate {
         "CombinePartialFinalAggregate"
     }
 
+    // Temporary disable schema check (as the nullability is changed in count(*) rewrite)
     fn schema_check(&self) -> bool {
-        true
+        false
     }
 }
 

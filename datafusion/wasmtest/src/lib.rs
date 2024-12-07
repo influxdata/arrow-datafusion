@@ -87,12 +87,14 @@ mod test {
 
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
+    #[allow(dead_code)]
     #[wasm_bindgen_test]
     fn datafusion_test() {
         basic_exprs();
         basic_parse();
     }
 
+    #[allow(dead_code)]
     #[wasm_bindgen_test]
     async fn basic_execute() {
         let sql = "SELECT 2 + 2;";
