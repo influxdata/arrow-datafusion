@@ -120,13 +120,6 @@ impl PhysicalSortExpr {
     }
 }
 
-/// Access the PhysicalSortExpr as a PhysicalExpr
-impl AsRef<dyn PhysicalExpr> for PhysicalSortExpr {
-    fn as_ref(&self) -> &(dyn PhysicalExpr + 'static) {
-        self.expr.as_ref()
-    }
-}
-
 impl PartialEq for PhysicalSortExpr {
     fn eq(&self, other: &PhysicalSortExpr) -> bool {
         self.options == other.options && self.expr.eq(&other.expr)
