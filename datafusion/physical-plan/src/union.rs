@@ -600,6 +600,7 @@ mod tests {
     use super::*;
     use crate::collect;
     use crate::memory::MemoryExec;
+    use crate::projection::ProjectionExec;
     use crate::test;
 
     use arrow_schema::{DataType, SortOptions};
@@ -738,6 +739,117 @@ mod tests {
         };
 
         assert_eq!(result, expected);
+    }
+
+    /// Return a `null` literal representing a struct type like: `{ name: Utf8 }`
+    fn struct_literal(name: &str) -> Arc<dyn PhysicalExpr> {
+        let struct_literal = ScalarValue::try_from(DataType::Struct(
+            vec![Field::new(name, DataType::Utf8, false)].into(),
+        ))
+        .unwrap();
+
+        datafusion_physical_expr::expressions::lit(struct_literal)
+    }
+
+    /// Build a tag field
+    fn build_tag_field(i: &usize) -> Field {
+        let name = format!("col{i}");
+        Field::new(
+            format!("col{i}"),
+            DataType::Struct(vec![Field::new(&name, DataType::Utf8, false)].into()),
+            true,
+        )
+    }
+
+    use rand::distributions::DistString;
+
+    #[tokio::test]
+    async fn test_dlw() -> Result<()> {
+        let build_schema = |included_tag_idx: Vec<usize>| -> Arc<Schema> {
+            let mut fields = vec![Field::new("col0", DataType::Utf8, false)];
+            let tag_fields = included_tag_idx
+                .iter()
+                .map(build_tag_field)
+                .collect::<Vec<_>>();
+            fields.extend_from_slice(&tag_fields);
+            Arc::new(Schema::new(fields))
+        };
+
+        // schema containing all fields
+        let schema = build_schema((1..=27).into_iter().collect_vec());
+        let options = SortOptions::default();
+
+        let make_child = |not_null: Vec<usize>| -> Result<Arc<dyn ExecutionPlan>> {
+            // build sort ordering
+            let not_null_cols = not_null
+                .iter()
+                .map(|i| col(&format!("col{i}"), &schema).unwrap())
+                .collect::<Vec<_>>();
+            let sort_orderings = convert_to_sort_exprs(
+                &not_null_cols
+                    .iter()
+                    .map(|col| (col, options))
+                    .collect::<Vec<_>>(),
+            );
+
+            /* build projection for union's input projection */
+            // projections 1..=27 are either col are NULL
+            let union_child_projection = (1..=27)
+                .into_iter()
+                .map(|i| {
+                    let name = format!("col{}", &i);
+                    let expr = if not_null.contains(&i) {
+                        col(&name, &schema).unwrap()
+                    } else {
+                        struct_literal(&name)
+                    };
+                    (expr, name)
+                })
+                .collect::<Vec<_>>();
+            // projection 1 is a constant, with a different value across each child
+            let constant = rand::distributions::Alphanumeric
+                .sample_string(&mut rand::thread_rng(), 16);
+            let union_child_projection = [
+                vec![(
+                    datafusion_physical_expr::expressions::lit(constant),
+                    "col0".into(),
+                )],
+                union_child_projection,
+            ]
+            .concat();
+
+            Ok(Arc::new(ProjectionExec::try_new(
+                union_child_projection,
+                Arc::new(
+                    MemoryExec::try_new(&[], Arc::clone(&schema), None)?
+                        .with_sort_information(vec![sort_orderings]),
+                ),
+            )?))
+        };
+
+        // first 4 children exactly the same, except a different constant
+        let child = make_child(vec![9, 15, 19, 25, 26, 27])?;
+        let mut union_children = (0..4)
+            .into_iter()
+            .map(|_| Arc::clone(&child))
+            .collect::<Vec<_>>();
+
+        // then a few children with some of the fields
+        union_children.push(make_child(vec![5, 9, 25, 26, 27])?);
+        union_children.push(make_child(vec![9, 25, 26, 27])?);
+        union_children.push(make_child(vec![9, 15, 19, 25, 26, 27])?);
+
+        // then the last child has all of the fields
+        let all_children = (0..=27).into_iter().collect();
+        union_children.push(make_child(all_children)?);
+
+        let props = UnionExec::compute_properties(&union_children, schema)?;
+        println!(
+            "equivalence_properties: {:?}",
+            props.equivalence_properties()
+        );
+
+        Ok(())
     }
 
     #[tokio::test]

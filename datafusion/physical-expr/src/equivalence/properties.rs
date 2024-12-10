@@ -1767,7 +1767,7 @@ impl UnionEquivalentOrderingBuilder {
     /// in the sort order and `b` was a constant).
     fn add_satisfied_orderings(
         &mut self,
-        orderings: impl IntoIterator<Item = LexOrdering>,
+        orderings: impl IntoIterator<Item = LexOrdering> + std::fmt::Debug,
         constants: &[ConstExpr],
         properties: &EquivalenceProperties,
     ) {
@@ -2042,6 +2042,90 @@ mod tests {
         assert_eq!(
             out_properties.to_string(),
             "order: [[a@0 ASC,c@2 ASC,b@1 ASC,d@3 ASC], [a@0 ASC,b@1 ASC,c@2 ASC,d@3 ASC]]"
+        );
+
+        Ok(())
+    }
+
+    // since our example case was UNIONing many partitions which were mostly constants (due to gap filling),
+    // make a test case with many more constants, with sort orders have many more constants.
+    // Include constants which are also flipped ordering themselves.
+    #[test]
+    fn project_equivalence_properties_test_multi_with_constants() -> Result<()> {
+        // test multiple input orderings with equivalence properties
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("c1", DataType::Int64, true),
+            Field::new("c2", DataType::Int64, true),
+            Field::new("c3", DataType::Int64, true),
+            Field::new("c4", DataType::Int64, true),
+            Field::new("c5", DataType::Int64, true),
+            Field::new("c6", DataType::Int64, true),
+            Field::new("d", DataType::Int64, true),
+            Field::new("e", DataType::Int64, true),
+        ]));
+
+        // have constants
+        let constants = vec![
+            ConstExpr::from(col("c1", &input_schema).unwrap()),
+            ConstExpr::from(col("c2", &input_schema).unwrap()),
+            ConstExpr::from(col("c3", &input_schema).unwrap()),
+            ConstExpr::from(col("c4", &input_schema).unwrap()),
+            ConstExpr::from(col("c5", &input_schema).unwrap()),
+            ConstExpr::from(col("c6", &input_schema).unwrap()),
+        ];
+
+        let mut input_properties = EquivalenceProperties::new(Arc::clone(&input_schema))
+            .with_constants(constants);
+
+        // add equivalent ordering [a, c, b, d]
+        input_properties.add_new_ordering(vec![
+            parse_sort_expr("a", &input_schema),
+            parse_sort_expr("d", &input_schema),
+            parse_sort_expr("c2", &input_schema), // c is constant
+            parse_sort_expr("c1", &input_schema), // c is constant
+            parse_sort_expr("c3", &input_schema), // c is constant
+            parse_sort_expr("b", &input_schema),  // NB b and c's are swapped
+            parse_sort_expr("e", &input_schema),
+            parse_sort_expr("c6", &input_schema), // c is constant
+            parse_sort_expr("c5", &input_schema), // c is constant
+            parse_sort_expr("c4", &input_schema), // c is constant
+        ]);
+
+        // add equivalent ordering [a, b, c, d]
+        input_properties.add_new_ordering(vec![
+            parse_sort_expr("a", &input_schema),
+            parse_sort_expr("b", &input_schema),
+            parse_sort_expr("c1", &input_schema),
+            parse_sort_expr("c2", &input_schema),
+            parse_sort_expr("c3", &input_schema),
+            parse_sort_expr("d", &input_schema),
+            parse_sort_expr("c4", &input_schema), // NB e and c's are swapped
+            parse_sort_expr("c5", &input_schema),
+            parse_sort_expr("c6", &input_schema),
+            parse_sort_expr("e", &input_schema),
+        ]);
+
+        // simply project all the columns in order
+        let proj_exprs = vec![
+            (col("a", &input_schema)?, "a".to_string()),
+            (col("b", &input_schema)?, "b".to_string()),
+            (col("c1", &input_schema)?, "c1".to_string()),
+            (col("c2", &input_schema)?, "c2".to_string()),
+            (col("c3", &input_schema)?, "c3".to_string()),
+            (col("c4", &input_schema)?, "c4".to_string()),
+            (col("c5", &input_schema)?, "c5".to_string()),
+            (col("c6", &input_schema)?, "c6".to_string()),
+            (col("d", &input_schema)?, "d".to_string()),
+            (col("e", &input_schema)?, "d".to_string()),
+        ];
+        let projection_mapping = ProjectionMapping::try_new(&proj_exprs, &input_schema)?;
+        let out_properties = input_properties.project(&projection_mapping, input_schema);
+
+        assert_eq!(
+            out_properties.to_string(),
+            "order: [[a@0 ASC,b@1 ASC,d@8 ASC,d@9 ASC], [a@0 ASC,d@8 ASC,b@1 ASC,d@9 ASC]], const: [c1@2,c2@3,c3@4,c4@5,c5@6,c6@7]"
         );
 
         Ok(())

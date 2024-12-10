@@ -662,12 +662,16 @@ mod tests {
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion_common::Result;
+    use datafusion_common::{Result, ScalarValue};
     use datafusion_expr::JoinType;
     use datafusion_physical_expr::expressions::{col, Column, NotExpr};
+    use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_optimizer::PhysicalOptimizerRule;
     use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 
+    use datafusion_physical_plan::memory::MemoryExec;
+    use datafusion_physical_plan::projection::ProjectionExec;
+    use itertools::Itertools;
     use rstest::rstest;
 
     fn create_test_schema() -> Result<SchemaRef> {
@@ -1048,6 +1052,144 @@ mod tests {
             "        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1",
             "          MemoryExec: partitions=1, partition_sizes=[0]"];
         assert_optimized!(expected_input, expected_optimized, physical_plan, true);
+
+        Ok(())
+    }
+
+    /// Return a `null` literal representing a struct type like: `{ name: Utf8 }`
+    fn struct_literal(name: &str) -> Arc<dyn PhysicalExpr> {
+        let struct_literal = ScalarValue::try_from(DataType::Struct(
+            vec![Field::new(name, DataType::Utf8, false)].into(),
+        ))
+        .unwrap();
+
+        datafusion_physical_expr::expressions::lit(struct_literal)
+    }
+
+    /// Build a tag field
+    fn build_tag_field(i: &usize) -> Field {
+        let name = format!("col{i}");
+        Field::new(
+            format!("col{i}"),
+            DataType::Struct(vec![Field::new(&name, DataType::Utf8, false)].into()),
+            true,
+        )
+    }
+
+    // Convert each tuple to PhysicalSortExpr
+    fn convert_to_sort_exprs(
+        in_data: &[(&Arc<dyn PhysicalExpr>, SortOptions)],
+    ) -> Vec<PhysicalSortExpr> {
+        in_data
+            .iter()
+            .map(|(expr, options)| PhysicalSortExpr {
+                expr: Arc::clone(*expr),
+                options: *options,
+            })
+            .collect::<Vec<_>>()
+    }
+
+    use rand::distributions::DistString;
+
+    #[tokio::test]
+    async fn test_dlw() -> Result<()> {
+        let build_schema = |included_tag_idx: Vec<usize>| -> Arc<Schema> {
+            let mut fields = vec![Field::new("col0", DataType::Utf8, false)];
+            let tag_fields = included_tag_idx
+                .iter()
+                .map(build_tag_field)
+                .collect::<Vec<_>>();
+            fields.extend_from_slice(&tag_fields);
+            Arc::new(Schema::new(fields))
+        };
+
+        /* 1. schema containing all fields */
+        let schema = build_schema((1..=27).into_iter().collect_vec());
+
+        let build_sort_expr = |cols_included: Vec<usize>| -> Vec<PhysicalSortExpr> {
+            let options = SortOptions::default();
+            let cols_included = cols_included
+                .iter()
+                .map(|i| col(&format!("col{i}"), &schema).unwrap())
+                .collect::<Vec<_>>();
+
+            convert_to_sort_exprs(
+                &cols_included
+                    .iter()
+                    .map(|col| (col, options))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let make_child = |not_null: Vec<usize>| -> Result<Arc<dyn ExecutionPlan>> {
+            // build sort ordering
+            let sort_orderings = build_sort_expr(not_null.clone());
+
+            /* build projection for union's input projection */
+            // projections 1..=27 are either col are NULL
+            let union_child_projection = (1..=27)
+                .into_iter()
+                .map(|i| {
+                    let name = format!("col{}", &i);
+                    let expr = if not_null.contains(&i) {
+                        col(&name, &schema).unwrap()
+                    } else {
+                        struct_literal(&name)
+                    };
+                    (expr, name)
+                })
+                .collect::<Vec<_>>();
+            // projection 1 is a constant, with a different value across each child
+            let constant = rand::distributions::Alphanumeric
+                .sample_string(&mut rand::thread_rng(), 16);
+            let union_child_projection = [
+                vec![(
+                    datafusion_physical_expr::expressions::lit(constant),
+                    "col0".into(),
+                )],
+                union_child_projection,
+            ]
+            .concat();
+
+            Ok(Arc::new(ProjectionExec::try_new(
+                union_child_projection,
+                Arc::new(
+                    MemoryExec::try_new(&[], Arc::clone(&schema), None)?
+                        .with_sort_information(vec![sort_orderings]),
+                ),
+            )?))
+        };
+
+        /* 2. build union children */
+        // first 4 children exactly the same, except a different constant
+        let child = make_child(vec![9, 15, 19, 25, 26, 27])?;
+        let mut union_children = (0..4)
+            .into_iter()
+            .map(|_| Arc::clone(&child))
+            .collect::<Vec<_>>();
+        // then a few children with some of the fields
+        union_children.push(make_child(vec![5, 9, 25, 26, 27])?);
+        union_children.push(make_child(vec![9, 25, 26, 27])?);
+        union_children.push(make_child(vec![9, 15, 19, 25, 26, 27])?);
+        // then the last child has all of the fields
+        let has_all_fields = (0..=27).into_iter().collect();
+        union_children.push(make_child(has_all_fields)?);
+
+        /* 3. create the `Sort(Union(children))` */
+        let final_sort = build_sort_expr((1..=27).into_iter().collect());
+        let sort_union_plan = sort_exec(final_sort, union_exec(union_children));
+
+        /* 4. run the enforce sorting rule */
+        let session_ctx = SessionContext::new();
+        let state = session_ctx.state();
+        let mut plan = sort_union_plan.clone();
+        let rules = vec![
+            Arc::new(EnforceDistribution::new()) as Arc<dyn PhysicalOptimizerRule>,
+            Arc::new(EnforceSorting::new()) as Arc<dyn PhysicalOptimizerRule>,
+        ];
+        for rule in rules {
+            plan = rule.optimize(plan, state.config_options())?;
+        }
 
         Ok(())
     }
