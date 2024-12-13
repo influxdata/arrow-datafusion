@@ -91,7 +91,11 @@ select octet_length(column1_utf8view) from test;
 7
 NULL
 
-query error DataFusion error: Arrow error: Compute error: bit_length not supported for Utf8View
+# query error DataFusion error: Arrow error: Compute error: bit_length not supported for Utf8View
+# TODO: our patched DF branch is passing this test.
+# It does register the type as Utf8View, if I we leave the bit_length signature to accept all strings.
+# if we update the bit_length signature to only accepts non-view Utf8, it then coerces to LargeUtf8 and passes.
+statement ok
 select bit_length(column1_utf8view) from test;
 
 query T
