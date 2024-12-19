@@ -659,6 +659,7 @@ impl DefaultPhysicalPlanner {
                 if &physical_input_schema != physical_input_schema_from_logical
                     && !options.execution.skip_physical_aggregate_schema_check
                 {
+                    log::warn!("Physical input schema should be the same as the one converted from logical input schema, but did not match for logical plan:\n{}", input.display_indent());
                     return internal_err!("Physical input schema should be the same as the one converted from logical input schema.");
                 }
 

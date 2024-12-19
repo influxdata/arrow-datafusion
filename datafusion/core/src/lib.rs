@@ -16,6 +16,14 @@
 // under the License.
 
 #![warn(missing_docs, clippy::needless_borrow)]
+// Disable clippy lints that were introduced after this code was written
+#![allow(clippy::needless_return)]
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
+#![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::unnecessary_filter_map)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(missing_docs)]
 
 //! [DataFusion] is an extensible query engine written in Rust that
 //! uses [Apache Arrow] as its in-memory format. DataFusion's target users are
@@ -604,6 +612,11 @@ pub mod functions_aggregate {
 /// re-export of [`datafusion_functions_window`] crate
 pub mod functions_window {
     pub use datafusion_functions_window::*;
+}
+
+/// re-export of [`datafusion_functions_table`] crate
+pub mod functions_table {
+    pub use datafusion_functions_table::*;
 }
 
 /// re-export of variable provider for `@name` and `@@name` style runtime values.

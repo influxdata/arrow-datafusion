@@ -890,6 +890,9 @@ SELECT
 ----
 false false false false false
 
+# on our DF patched branch, we are getting the latest correct behavior
+# which only occurred on DF main with the upgrade to arrow 53.3.0
+# refer to <https://github.com/apache/datafusion/blame/9f530dd1987d863dd4de99198df5b2c3e242bf6e/datafusion/sqllogictest/test_files/string/string_literal.slt#L924>
 # escape before non-wildcard matches the escape itself
 query BBBBBBB
 SELECT
@@ -901,7 +904,7 @@ SELECT
     '\' LIKE '\\',
     '\\' LIKE '\\'
 ----
-false true false true false false true
+true false false true false true false
 
 # if "%%" in the pattern was simplified to "%", the pattern semantics would change
 query BBBBB
@@ -931,6 +934,9 @@ SELECT a, a LIKE '\%%' FROM inputs
 statement ok
 drop table inputs;
 
+# on our DF patched branch, we are getting the latest correct behavior
+# which only occurred on DF main with the upgrade to arrow 53.3.0
+# refer to <https://github.com/apache/datafusion/commit/a2811fc85d469c879e3d4db6ceb3fa13fbf263be>
 # constant folding and expression simplification cannot kick in
 query TTB
 WITH data(a) AS (VALUES
@@ -1002,7 +1008,7 @@ NULL \%abc NULL
 \ NULL NULL
 \ (empty) false
 \ \ true
-\ \\ false
+\ \\ true
 \ \\\ false
 \ \\\\ false
 \ a false
@@ -1010,10 +1016,10 @@ NULL \%abc NULL
 \ \\a false
 \ % true
 \ \% false
-\ \\% false
+\ \\% true
 \ %% true
 \ \%% false
-\ \\%% false
+\ \\%% true
 \ _ true
 \ \_ false
 \ \\_ false
@@ -1028,21 +1034,21 @@ NULL \%abc NULL
 \\ NULL NULL
 \\ (empty) false
 \\ \ false
-\\ \\ true
-\\ \\\ false
-\\ \\\\ false
+\\ \\ false
+\\ \\\ true
+\\ \\\\ true
 \\ a false
 \\ \a false
 \\ \\a false
 \\ % true
 \\ \% false
-\\ \\% false
+\\ \\% true
 \\ %% true
 \\ \%% false
-\\ \\%% false
+\\ \\%% true
 \\ _ false
 \\ \_ false
-\\ \\_ false
+\\ \\_ true
 \\ __ true
 \\ \__ false
 \\ \\__ false
@@ -1055,23 +1061,23 @@ NULL \%abc NULL
 \\\ (empty) false
 \\\ \ false
 \\\ \\ false
-\\\ \\\ true
+\\\ \\\ false
 \\\ \\\\ false
 \\\ a false
 \\\ \a false
 \\\ \\a false
 \\\ % true
 \\\ \% false
-\\\ \\% false
+\\\ \\% true
 \\\ %% true
 \\\ \%% false
-\\\ \\%% false
+\\\ \\%% true
 \\\ _ false
 \\\ \_ false
 \\\ \\_ false
 \\\ __ false
 \\\ \__ false
-\\\ \\__ false
+\\\ \\__ true
 \\\ abc false
 \\\ a_c false
 \\\ a\_c false
@@ -1082,16 +1088,16 @@ NULL \%abc NULL
 \\\\ \ false
 \\\\ \\ false
 \\\\ \\\ false
-\\\\ \\\\ true
+\\\\ \\\\ false
 \\\\ a false
 \\\\ \a false
 \\\\ \\a false
 \\\\ % true
 \\\\ \% false
-\\\\ \\% false
+\\\\ \\% true
 \\\\ %% true
 \\\\ \%% false
-\\\\ \\%% false
+\\\\ \\%% true
 \\\\ _ false
 \\\\ \_ false
 \\\\ \\_ false
@@ -1110,7 +1116,7 @@ a \\ false
 a \\\ false
 a \\\\ false
 a a true
-a \a false
+a \a true
 a \\a false
 a % true
 a \% false
@@ -1136,17 +1142,17 @@ a \%abc false
 \a \\\ false
 \a \\\\ false
 \a a false
-\a \a true
-\a \\a false
+\a \a false
+\a \\a true
 \a % true
 \a \% false
-\a \\% false
+\a \\% true
 \a %% true
 \a \%% false
-\a \\%% false
+\a \\%% true
 \a _ false
 \a \_ false
-\a \\_ false
+\a \\_ true
 \a __ true
 \a \__ false
 \a \\__ false
@@ -1163,19 +1169,19 @@ a \%abc false
 \\a \\\\ false
 \\a a false
 \\a \a false
-\\a \\a true
+\\a \\a false
 \\a % true
 \\a \% false
-\\a \\% false
+\\a \\% true
 \\a %% true
 \\a \%% false
-\\a \\%% false
+\\a \\%% true
 \\a _ false
 \\a \_ false
 \\a \\_ false
 \\a __ false
 \\a \__ false
-\\a \\__ false
+\\a \\__ true
 \\a abc false
 \\a a_c false
 \\a a\_c false
@@ -1224,7 +1230,7 @@ a \%abc false
 \% \\%% true
 \% _ false
 \% \_ false
-\% \\_ false
+\% \\_ true
 \% __ true
 \% \__ false
 \% \\__ false
@@ -1244,16 +1250,16 @@ a \%abc false
 \\% \\a false
 \\% % true
 \\% \% false
-\\% \\% false
+\\% \\% true
 \\% %% true
 \\% \%% false
-\\% \\%% false
+\\% \\%% true
 \\% _ false
 \\% \_ false
 \\% \\_ false
 \\% __ false
 \\% \__ false
-\\% \\__ false
+\\% \\__ true
 \\% abc false
 \\% a_c false
 \\% a\_c false
@@ -1296,7 +1302,7 @@ a \%abc false
 \%% \\a false
 \%% % true
 \%% \% false
-\%% \\% false
+\%% \\% true
 \%% %% true
 \%% \%% false
 \%% \\%% true
@@ -1305,7 +1311,7 @@ a \%abc false
 \%% \\_ false
 \%% __ false
 \%% \__ false
-\%% \\__ false
+\%% \\__ true
 \%% abc false
 \%% a_c false
 \%% a\_c false
@@ -1322,10 +1328,10 @@ a \%abc false
 \\%% \\a false
 \\%% % true
 \\%% \% false
-\\%% \\% false
+\\%% \\% true
 \\%% %% true
 \\%% \%% false
-\\%% \\%% false
+\\%% \\%% true
 \\%% _ false
 \\%% \_ false
 \\%% \\_ false
@@ -1374,10 +1380,10 @@ _ \%abc false
 \_ \\a false
 \_ % true
 \_ \% false
-\_ \\% false
+\_ \\% true
 \_ %% true
 \_ \%% false
-\_ \\%% false
+\_ \\%% true
 \_ _ false
 \_ \_ false
 \_ \\_ true
@@ -1400,16 +1406,16 @@ _ \%abc false
 \\_ \\a false
 \\_ % true
 \\_ \% false
-\\_ \\% false
+\\_ \\% true
 \\_ %% true
 \\_ \%% false
-\\_ \\%% false
+\\_ \\%% true
 \\_ _ false
 \\_ \_ false
 \\_ \\_ false
 \\_ __ false
 \\_ \__ false
-\\_ \\__ false
+\\_ \\__ true
 \\_ abc false
 \\_ a_c false
 \\_ a\_c false
@@ -1452,10 +1458,10 @@ __ \%abc false
 \__ \\a false
 \__ % true
 \__ \% false
-\__ \\% false
+\__ \\% true
 \__ %% true
 \__ \%% false
-\__ \\%% false
+\__ \\%% true
 \__ _ false
 \__ \_ false
 \__ \\_ false
@@ -1478,10 +1484,10 @@ __ \%abc false
 \\__ \\a false
 \\__ % true
 \\__ \% false
-\\__ \\% false
+\\__ \\% true
 \\__ %% true
 \\__ \%% false
-\\__ \\%% false
+\\__ \\%% true
 \\__ _ false
 \\__ \_ false
 \\__ \\_ false
@@ -1608,7 +1614,7 @@ a\_c \%abc false
 \%abc \\a false
 \%abc % true
 \%abc \% false
-\%abc \\% false
+\%abc \\% true
 \%abc %% true
 \%abc \%% false
 \%abc \\%% true

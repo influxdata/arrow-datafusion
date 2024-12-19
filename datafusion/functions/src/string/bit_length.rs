@@ -40,7 +40,11 @@ impl Default for BitLengthFunc {
 impl BitLengthFunc {
     pub fn new() -> Self {
         Self {
-            signature: Signature::string(1, Volatility::Immutable),
+            signature: Signature::uniform(
+                1,
+                vec![DataType::Utf8, DataType::LargeUtf8],
+                Volatility::Immutable,
+            ),
         }
     }
 }

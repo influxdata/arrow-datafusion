@@ -468,31 +468,42 @@ pub fn can_interleave<T: Borrow<Arc<dyn ExecutionPlan>>>(
 }
 
 fn union_schema(inputs: &[Arc<dyn ExecutionPlan>]) -> SchemaRef {
-    let first_schema = inputs[0].schema();
+    // needs to handle n children, including child which have an empty projection or different number of fields
+    let num_fields = inputs.iter().fold(0, |acc, input| {
+        std::cmp::max(acc, input.schema().fields().len())
+    });
 
-    let fields = (0..first_schema.fields().len())
+    let fields: Vec<Field> = (0..num_fields)
         .map(|i| {
-            inputs
-                .iter()
-                .enumerate()
-                .map(|(input_idx, input)| {
-                    let field = input.schema().field(i).clone();
-                    let mut metadata = field.metadata().clone();
+            // collect fields for i
+            let field_options_for_i =
+                inputs.iter().enumerate().filter_map(|(input_idx, input)| {
+                    let field = if input.schema().fields().len() <= i {
+                        return None;
+                    } else {
+                        input.schema().field(i).clone()
+                    };
 
+                    // merge field metadata
+                    let mut metadata = field.metadata().clone();
                     let other_metadatas = inputs
                         .iter()
                         .enumerate()
-                        .filter(|(other_idx, _)| *other_idx != input_idx)
+                        .filter(|(other_idx, other_input)| {
+                            *other_idx != input_idx
+                                && other_input.schema().fields().len() > i
+                        })
                         .flat_map(|(_, other_input)| {
                             other_input.schema().field(i).metadata().clone().into_iter()
                         });
-
                     metadata.extend(other_metadatas);
-                    field.with_metadata(metadata)
-                })
+                    Some(field.with_metadata(metadata))
+                });
+
+            // pick first nullable field (if exists)
+            field_options_for_i
                 .find_or_first(Field::is_nullable)
-                // We can unwrap this because if inputs was empty, this would've already panic'ed when we
-                // indexed into inputs[0].
+                // We can unwrap this because if inputs was empty, we would never had iterated with (0..num_fields)
                 .unwrap()
         })
         .collect::<Vec<_>>();
