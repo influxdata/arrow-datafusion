@@ -405,6 +405,7 @@ impl Optimizer {
                                 Box::new(e),
                             )
                         })?;
+                    #[cfg(debug_assertions)]
                     tnr.data.check_invariants(InvariantLevel::Executable)
                         .map_err(|e| {
                             DataFusionError::Context(
