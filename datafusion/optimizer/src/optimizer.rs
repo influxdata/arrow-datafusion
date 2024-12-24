@@ -386,7 +386,6 @@ impl Optimizer {
                     .skip_failed_rules
                     .then(|| new_plan.clone());
 
-                #[cfg(debug_assertions)]
                 let starting_schema = Arc::clone(new_plan.schema());
 
                 let result = match rule.apply_order() {
@@ -399,7 +398,6 @@ impl Optimizer {
                 }
                 .and_then(|tnr| {
                     // in debug mode, run checks are each optimer pass
-                    #[cfg(debug_assertions)]
                     assert_valid_optimization(&tnr.data, &starting_schema)
                         .map_err(|e| {
                             DataFusionError::Context(
@@ -407,7 +405,6 @@ impl Optimizer {
                                 Box::new(e),
                             )
                         })?;
-                    #[cfg(debug_assertions)]
                     tnr.data.check_invariants(InvariantLevel::Executable)
                         .map_err(|e| {
                             DataFusionError::Context(
