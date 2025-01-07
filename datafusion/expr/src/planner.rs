@@ -25,7 +25,6 @@ use datafusion_common::{
     config::ConfigOptions, file_options::file_type::FileType, not_impl_err, DFSchema,
     Result, TableReference,
 };
-use sqlparser::ast;
 
 use crate::{AggregateUDF, Expr, GetFieldAccess, ScalarUDF, TableSource, WindowUDF};
 
@@ -65,11 +64,6 @@ pub trait ContextProvider {
     /// Getter for expr planners
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
         &[]
-    }
-
-    /// Getter for the data type planner
-    fn get_type_planner(&self) -> Option<Arc<dyn TypePlanner>> {
-        None
     }
 
     /// Getter for a UDF description
@@ -222,7 +216,7 @@ pub trait ExprPlanner: Debug + Send + Sync {
 /// custom expressions.
 #[derive(Debug, Clone)]
 pub struct RawBinaryExpr {
-    pub op: ast::BinaryOperator,
+    pub op: sqlparser::ast::BinaryOperator,
     pub left: Expr,
     pub right: Expr,
 }
@@ -254,14 +248,4 @@ pub enum PlannerResult<T> {
     Planned(Expr),
     /// The raw expression could not be planned, and is returned unmodified
     Original(T),
-}
-
-/// This trait allows users to customize the behavior of the data type planning
-pub trait TypePlanner: Debug + Send + Sync {
-    /// Plan SQL type to DataFusion data type
-    ///
-    /// Returns None if not possible
-    fn plan_type(&self, _sql_type: &ast::DataType) -> Result<Option<DataType>> {
-        Ok(None)
-    }
 }
