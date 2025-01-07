@@ -472,7 +472,8 @@ mod tests {
         ])));
         let args = &[c0, c1, c2, c3, c4];
 
-        let result = ConcatFunc::new().invoke_batch(args, 3)?;
+        #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
+        let result = ConcatFunc::new().invoke(args)?;
         let expected =
             Arc::new(StringViewArray::from(vec!["foo,x,a", "bar,,", "baz,z,b"]))
                 as ArrayRef;

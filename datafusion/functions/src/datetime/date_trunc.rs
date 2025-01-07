@@ -484,7 +484,7 @@ mod tests {
 
     use arrow::array::cast::as_primitive_array;
     use arrow::array::types::TimestampNanosecondType;
-    use arrow::array::{Array, TimestampNanosecondArray};
+    use arrow::array::TimestampNanosecondArray;
     use arrow::compute::kernels::cast_utils::string_to_timestamp_nanos;
     use arrow::datatypes::{DataType, TimeUnit};
     use datafusion_common::ScalarValue;
@@ -724,15 +724,12 @@ mod tests {
                 .map(|s| Some(string_to_timestamp_nanos(s).unwrap()))
                 .collect::<TimestampNanosecondArray>()
                 .with_timezone_opt(tz_opt.clone());
-            let batch_size = input.len();
+            #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
             let result = DateTruncFunc::new()
-                .invoke_batch(
-                    &[
-                        ColumnarValue::Scalar(ScalarValue::from("day")),
-                        ColumnarValue::Array(Arc::new(input)),
-                    ],
-                    batch_size,
-                )
+                .invoke(&[
+                    ColumnarValue::Scalar(ScalarValue::from("day")),
+                    ColumnarValue::Array(Arc::new(input)),
+                ])
                 .unwrap();
             if let ColumnarValue::Array(result) = result {
                 assert_eq!(
@@ -886,15 +883,12 @@ mod tests {
                 .map(|s| Some(string_to_timestamp_nanos(s).unwrap()))
                 .collect::<TimestampNanosecondArray>()
                 .with_timezone_opt(tz_opt.clone());
-            let batch_size = input.len();
+            #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
             let result = DateTruncFunc::new()
-                .invoke_batch(
-                    &[
-                        ColumnarValue::Scalar(ScalarValue::from("hour")),
-                        ColumnarValue::Array(Arc::new(input)),
-                    ],
-                    batch_size,
-                )
+                .invoke(&[
+                    ColumnarValue::Scalar(ScalarValue::from("hour")),
+                    ColumnarValue::Array(Arc::new(input)),
+                ])
                 .unwrap();
             if let ColumnarValue::Array(result) = result {
                 assert_eq!(

@@ -213,8 +213,8 @@ mod tests {
         }
 
         fn test_scalar(sv: ScalarValue, tc: &TestCase) {
-            let to_date_result =
-                ToDateFunc::new().invoke_batch(&[ColumnarValue::Scalar(sv)], 1);
+            #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
+            let to_date_result = ToDateFunc::new().invoke(&[ColumnarValue::Scalar(sv)]);
 
             match to_date_result {
                 Ok(ColumnarValue::Scalar(ScalarValue::Date32(date_val))) => {
@@ -234,9 +234,9 @@ mod tests {
             A: From<Vec<&'static str>> + Array + 'static,
         {
             let date_array = A::from(vec![tc.date_str]);
-            let batch_size = date_array.len();
-            let to_date_result = ToDateFunc::new()
-                .invoke_batch(&[ColumnarValue::Array(Arc::new(date_array))], batch_size);
+            #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
+            let to_date_result =
+                ToDateFunc::new().invoke(&[ColumnarValue::Array(Arc::new(date_array))]);
 
             match to_date_result {
                 Ok(ColumnarValue::Array(a)) => {
@@ -325,13 +325,11 @@ mod tests {
         fn test_scalar(sv: ScalarValue, tc: &TestCase) {
             let format_scalar = ScalarValue::Utf8(Some(tc.format_str.to_string()));
 
-            let to_date_result = ToDateFunc::new().invoke_batch(
-                &[
-                    ColumnarValue::Scalar(sv),
-                    ColumnarValue::Scalar(format_scalar),
-                ],
-                1,
-            );
+            #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
+            let to_date_result = ToDateFunc::new().invoke(&[
+                ColumnarValue::Scalar(sv),
+                ColumnarValue::Scalar(format_scalar),
+            ]);
 
             match to_date_result {
                 Ok(ColumnarValue::Scalar(ScalarValue::Date32(date_val))) => {
@@ -352,14 +350,11 @@ mod tests {
             let date_array = A::from(vec![tc.formatted_date]);
             let format_array = A::from(vec![tc.format_str]);
 
-            let batch_size = date_array.len();
-            let to_date_result = ToDateFunc::new().invoke_batch(
-                &[
-                    ColumnarValue::Array(Arc::new(date_array)),
-                    ColumnarValue::Array(Arc::new(format_array)),
-                ],
-                batch_size,
-            );
+            #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
+            let to_date_result = ToDateFunc::new().invoke(&[
+                ColumnarValue::Array(Arc::new(date_array)),
+                ColumnarValue::Array(Arc::new(format_array)),
+            ]);
 
             match to_date_result {
                 Ok(ColumnarValue::Array(a)) => {
@@ -391,14 +386,12 @@ mod tests {
         let format1_scalar = ScalarValue::Utf8(Some("%Y-%m-%d".into()));
         let format2_scalar = ScalarValue::Utf8(Some("%Y/%m/%d".into()));
 
-        let to_date_result = ToDateFunc::new().invoke_batch(
-            &[
-                ColumnarValue::Scalar(formatted_date_scalar),
-                ColumnarValue::Scalar(format1_scalar),
-                ColumnarValue::Scalar(format2_scalar),
-            ],
-            1,
-        );
+        #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
+        let to_date_result = ToDateFunc::new().invoke(&[
+            ColumnarValue::Scalar(formatted_date_scalar),
+            ColumnarValue::Scalar(format1_scalar),
+            ColumnarValue::Scalar(format2_scalar),
+        ]);
 
         match to_date_result {
             Ok(ColumnarValue::Scalar(ScalarValue::Date32(date_val))) => {
@@ -422,8 +415,9 @@ mod tests {
         for date_str in test_cases {
             let formatted_date_scalar = ScalarValue::Utf8(Some(date_str.into()));
 
-            let to_date_result = ToDateFunc::new()
-                .invoke_batch(&[ColumnarValue::Scalar(formatted_date_scalar)], 1);
+            #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
+            let to_date_result =
+                ToDateFunc::new().invoke(&[ColumnarValue::Scalar(formatted_date_scalar)]);
 
             match to_date_result {
                 Ok(ColumnarValue::Scalar(ScalarValue::Date32(date_val))) => {
@@ -440,8 +434,9 @@ mod tests {
         let date_str = "20241231";
         let date_scalar = ScalarValue::Utf8(Some(date_str.into()));
 
+        #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
         let to_date_result =
-            ToDateFunc::new().invoke_batch(&[ColumnarValue::Scalar(date_scalar)], 1);
+            ToDateFunc::new().invoke(&[ColumnarValue::Scalar(date_scalar)]);
 
         match to_date_result {
             Ok(ColumnarValue::Scalar(ScalarValue::Date32(date_val))) => {
@@ -461,8 +456,9 @@ mod tests {
         let date_str = "202412311";
         let date_scalar = ScalarValue::Utf8(Some(date_str.into()));
 
+        #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
         let to_date_result =
-            ToDateFunc::new().invoke_batch(&[ColumnarValue::Scalar(date_scalar)], 1);
+            ToDateFunc::new().invoke(&[ColumnarValue::Scalar(date_scalar)]);
 
         if let Ok(ColumnarValue::Scalar(ScalarValue::Date32(_))) = to_date_result {
             panic!(
