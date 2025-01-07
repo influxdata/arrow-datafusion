@@ -35,7 +35,6 @@ SELECT * from information_schema.tables;
 ----
 datafusion information_schema columns VIEW
 datafusion information_schema df_settings VIEW
-datafusion information_schema parameters VIEW
 datafusion information_schema routines VIEW
 datafusion information_schema schemata VIEW
 datafusion information_schema tables VIEW
@@ -82,14 +81,12 @@ SELECT * from information_schema.tables;
 ----
 datafusion information_schema columns VIEW
 datafusion information_schema df_settings VIEW
-datafusion information_schema parameters VIEW
 datafusion information_schema routines VIEW
 datafusion information_schema schemata VIEW
 datafusion information_schema tables VIEW
 datafusion information_schema views VIEW
 my_catalog information_schema columns VIEW
 my_catalog information_schema df_settings VIEW
-my_catalog information_schema parameters VIEW
 my_catalog information_schema routines VIEW
 my_catalog information_schema schemata VIEW
 my_catalog information_schema tables VIEW
@@ -98,7 +95,6 @@ my_catalog my_schema t1 BASE TABLE
 my_catalog my_schema t2 BASE TABLE
 my_other_catalog information_schema columns VIEW
 my_other_catalog information_schema df_settings VIEW
-my_other_catalog information_schema parameters VIEW
 my_other_catalog information_schema routines VIEW
 my_other_catalog information_schema schemata VIEW
 my_other_catalog information_schema tables VIEW
