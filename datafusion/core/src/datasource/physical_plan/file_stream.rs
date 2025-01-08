@@ -522,8 +522,10 @@ impl<F: FileOpener> RecordBatchStream for FileStream<F> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::task::Wake;
 
     use super::*;
     use crate::datasource::object_store::ObjectStoreUrl;
@@ -532,6 +534,7 @@ mod tests {
 
     use arrow_schema::Schema;
     use datafusion_common::internal_err;
+    use pin_project_lite::pin_project;
 
     /// Test `FileOpener` which will simulate errors during file opening or scanning
     #[derive(Default)]
@@ -624,6 +627,14 @@ mod tests {
 
         /// Collect the results of the `FileStream`
         pub async fn result(self) -> Result<Vec<RecordBatch>> {
+            self.result_with_cnt_yields()
+                .await
+                .map(|(batches, _)| batches)
+        }
+
+        /// Collect the results of the `FileStream`, and count the number of yields
+        /// back to the runtime.
+        pub async fn result_with_cnt_yields(self) -> Result<(Vec<RecordBatch>, usize)> {
             let file_schema = self
                 .opener
                 .records
@@ -661,11 +672,85 @@ mod tests {
                 .unwrap()
                 .with_on_error(on_error);
 
-            file_stream
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()
+            Collector::new(file_stream).collect().await
+        }
+    }
+
+    /// A waker that wakes up the current thread when called,
+    /// and tracks the number of wakings.
+    struct ThreadWaker {
+        pub thread: std::thread::Thread,
+        pub wake_cnt: AtomicUsize,
+    }
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            let _ = self.wake_cnt.fetch_add(1, Ordering::SeqCst);
+            self.thread.unpark();
+        }
+    }
+
+    pin_project! {
+        /// Perform a stream collect(), with the counting [`ThreadWaker`].
+        pub struct Collector<St> {
+            #[pin]
+            stream: St,
+            collection: Vec<RecordBatch>,
+        }
+    }
+
+    impl<St: Stream<Item = Result<RecordBatch>>> Collector<St> {
+        pub fn new(stream: St) -> Self {
+            Self {
+                stream,
+                collection: Default::default(),
+            }
+        }
+
+        pub async fn collect(mut self) -> Result<(Vec<RecordBatch>, usize)> {
+            let mut pinned = std::pin::pin!(self);
+
+            // Create a new context, with the tracked waker.
+            let thread = std::thread::current();
+            let counting_waker = Arc::new(ThreadWaker {
+                thread,
+                wake_cnt: Default::default(),
+            });
+            let waker = Arc::clone(&counting_waker).into();
+            let mut cx = Context::from_waker(&waker);
+
+            // poll future with provided context
+            loop {
+                match pinned.as_mut().poll(&mut cx) {
+                    Poll::Ready(Ok(batches)) => {
+                        return Ok((
+                            batches,
+                            counting_waker.wake_cnt.load(Ordering::SeqCst),
+                        ))
+                    }
+                    Poll::Ready(Err(e)) => return Err(e),
+                    _ => continue,
+                }
+            }
+        }
+
+        fn finish(self: Pin<&mut Self>) -> Vec<RecordBatch> {
+            mem::take(self.project().collection)
+        }
+    }
+
+    impl<St: Stream<Item = Result<RecordBatch>>> Future for Collector<St> {
+        type Output = Result<Vec<RecordBatch>>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let mut this = self.as_mut().project();
+            loop {
+                match ready!(this.stream.as_mut().poll_next(cx)) {
+                    Some(Ok(rb)) => this.collection.push(rb),
+                    Some(Err(e)) => return Poll::Ready(Err(e)),
+                    None => return Poll::Ready(Ok(self.finish())),
+                }
+            }
         }
     }
 
@@ -971,6 +1056,38 @@ mod tests {
             "| 0 |",
             "+---+",
         ], &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_stream_will_yield_btwn_open_files() -> Result<()> {
+        let (batches, woken) = FileStreamTest::new()
+            .with_records(vec![make_partition(3), make_partition(2)])
+            .with_num_files(1)
+            .result_with_cnt_yields()
+            .await?;
+        assert_eq!(
+            batches.len(),
+            2,
+            "should have 2 batches per file, and 1 file"
+        );
+        assert_eq!(
+            woken, 0,
+            "never yielded for single open files with reader ready"
+        );
+
+        let (batches, woken) = FileStreamTest::new()
+            .with_records(vec![make_partition(3), make_partition(2)])
+            .with_num_files(3)
+            .result_with_cnt_yields()
+            .await?;
+        assert_eq!(
+            batches.len(),
+            6,
+            "should have 2 batches per file, and 3 files"
+        );
+        assert_eq!(woken, 2, "should yield btwn each open file");
 
         Ok(())
     }
