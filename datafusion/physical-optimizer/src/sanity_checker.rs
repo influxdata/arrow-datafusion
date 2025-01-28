@@ -32,9 +32,9 @@ use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_physical_expr::intervals::utils::{check_support, is_datatype_supported};
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::joins::SymmetricHashJoinExec;
-use datafusion_physical_plan::{get_plan_string, ExecutionPlanProperties};
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::union::UnionExec;
+use datafusion_physical_plan::{get_plan_string, ExecutionPlanProperties};
 
 use crate::PhysicalOptimizerRule;
 use datafusion_physical_expr_common::sort_expr::format_physical_sort_requirement_list;
