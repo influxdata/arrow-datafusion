@@ -76,17 +76,38 @@ fn calculate_union_binary(
         })
         .collect::<Vec<_>>();
 
+    // TEMP HACK WORKAROUND
+    // Revert code from https://github.com/apache/datafusion/pull/12562
+    // Context: https://github.com/apache/datafusion/issues/13748
+    // Context: https://github.com/influxdata/influxdb_iox/issues/13038
+
     // Next, calculate valid orderings for the union by searching for prefixes
     // in both sides.
-    let mut orderings = UnionEquivalentOrderingBuilder::new();
-    orderings.add_satisfied_orderings(lhs.normalized_oeq_class(), lhs.constants(), &rhs);
-    orderings.add_satisfied_orderings(rhs.normalized_oeq_class(), rhs.constants(), &lhs);
-    let orderings = orderings.build();
-
-    let mut eq_properties =
-        EquivalenceProperties::new(lhs.schema).with_constants(constants);
-
+    let mut orderings = vec![];
+    for mut ordering in lhs.normalized_oeq_class().into_iter() {
+        // Progressively shorten the ordering to search for a satisfied prefix:
+        while !rhs.ordering_satisfy(&ordering) {
+            ordering.pop();
+        }
+        // There is a non-trivial satisfied prefix, add it as a valid ordering:
+        if !ordering.is_empty() {
+            orderings.push(ordering);
+        }
+    }
+    for mut ordering in rhs.normalized_oeq_class().into_iter() {
+        // Progressively shorten the ordering to search for a satisfied prefix:
+        while !lhs.ordering_satisfy(&ordering) {
+            ordering.pop();
+        }
+        // There is a non-trivial satisfied prefix, add it as a valid ordering:
+        if !ordering.is_empty() {
+            orderings.push(ordering);
+        }
+    }
+    let mut eq_properties = EquivalenceProperties::new(lhs.schema);
+    eq_properties.constants = constants;
     eq_properties.add_new_orderings(orderings);
+
     Ok(eq_properties)
 }
 
@@ -132,6 +153,7 @@ struct UnionEquivalentOrderingBuilder {
     orderings: Vec<LexOrdering>,
 }
 
+#[expect(unused)]
 impl UnionEquivalentOrderingBuilder {
     fn new() -> Self {
         Self { orderings: vec![] }
