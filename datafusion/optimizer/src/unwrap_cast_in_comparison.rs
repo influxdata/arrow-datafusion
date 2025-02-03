@@ -25,6 +25,7 @@ use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
 use crate::utils::NamePreserver;
+#[allow(deprecated)]
 use arrow::datatypes::{
     DataType, TimeUnit, MAX_DECIMAL_FOR_EACH_PRECISION, MIN_DECIMAL_FOR_EACH_PRECISION,
 };
@@ -369,7 +370,9 @@ fn try_cast_numeric_literal(
             // Different precision for decimal128 can store different range of value.
             // For example, the precision is 3, the max of value is `999` and the min
             // value is `-999`
+            #[allow(deprecated)]
             MIN_DECIMAL_FOR_EACH_PRECISION[*precision as usize - 1],
+            #[allow(deprecated)]
             MAX_DECIMAL_FOR_EACH_PRECISION[*precision as usize - 1],
         ),
         _ => return None,

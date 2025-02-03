@@ -311,6 +311,7 @@ impl FileOpener for ArrowOpener {
                     {
                         decoder.read_dictionary(
                             dict_block,
+                            #[allow(deprecated)]
                             &Buffer::from_bytes(dict_result.into()),
                         )?;
                     }
@@ -350,6 +351,7 @@ impl FileOpener for ArrowOpener {
                                 decoder
                                     .read_record_batch(
                                         &block,
+                                        #[allow(deprecated)]
                                         &Buffer::from_bytes(data.into()),
                                     )
                                     .transpose()
