@@ -25,6 +25,7 @@ use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
 use crate::utils::NamePreserver;
+#[allow(deprecated)]
 use arrow::datatypes::{
     DataType, TimeUnit, MAX_DECIMAL128_FOR_EACH_PRECISION,
     MIN_DECIMAL128_FOR_EACH_PRECISION,
