@@ -37,7 +37,7 @@
 
 use std::sync::Arc;
 
-use super::utils::{add_sort_above, add_sort_above_with_check};
+use super::utils::{add_sort_above, add_sort_above_with_check, is_aggregation};
 use crate::config::ConfigOptions;
 use crate::error::Result;
 use crate::physical_optimizer::replace_with_order_preserving_variants::{
@@ -516,7 +516,7 @@ fn remove_bottleneck_in_subplan(
 ) -> Result<PlanWithCorrespondingCoalescePartitions> {
     let plan = &requirements.plan;
     let children = &mut requirements.children;
-    if is_coalesce_partitions(&children[0].plan) {
+    if is_coalesce_partitions(&children[0].plan) && !is_aggregation(plan) {
         // We can safely use the 0th index since we have a `CoalescePartitionsExec`.
         let mut new_child_node = children[0].children.swap_remove(0);
         while new_child_node.plan.output_partitioning() == plan.output_partitioning()
@@ -657,7 +657,11 @@ fn get_sort_exprs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::physical_optimizer::enforce_distribution::tests::{
+        parquet_exec_with_stats, projection_exec_with_alias, schema,
+    };
     use crate::physical_optimizer::enforce_distribution::EnforceDistribution;
+    use crate::physical_optimizer::sanity_checker::SanityCheckPlan;
     use crate::physical_optimizer::test_utils::{
         aggregate_exec, bounded_window_exec, check_integrity, coalesce_batches_exec,
         coalesce_partitions_exec, filter_exec, global_limit_exec, hash_join_exec,
@@ -675,7 +679,11 @@ mod tests {
     use datafusion_common::Result;
     use datafusion_expr::JoinType;
     use datafusion_physical_expr::expressions::{col, Column, NotExpr};
+    use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_optimizer::PhysicalOptimizerRule;
+    use datafusion_physical_plan::aggregates::{
+        AggregateExec, AggregateMode, PhysicalGroupBy,
+    };
     use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 
     use rstest::rstest;
@@ -2180,6 +2188,94 @@ mod tests {
         let second_plan = plan.clone();
 
         assert_eq!(get_plan_string(&first_plan), get_plan_string(&second_plan));
+        Ok(())
+    }
+
+    fn single_partition_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        alias_pairs: Vec<(String, String)>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = schema();
+        let group_by = alias_pairs
+            .iter()
+            .map(|(column, alias)| {
+                (col(column, &input.schema()).unwrap(), alias.to_string())
+            })
+            .collect::<Vec<_>>();
+        let group_by = PhysicalGroupBy::new_single(group_by);
+
+        Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::SinglePartitioned,
+                group_by,
+                vec![],
+                vec![],
+                input,
+                schema,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_preserve_needed_coalesce() -> Result<()> {
+        // Input to EnforceSorting, from our test case.
+        let plan = projection_exec_with_alias(
+            union_exec(vec![parquet_exec_with_stats(); 2]),
+            vec![
+                ("a".to_string(), "a".to_string()),
+                ("b".to_string(), "value".to_string()),
+            ],
+        );
+        let plan = Arc::new(CoalescePartitionsExec::new(plan));
+        let schema = schema();
+        let sort_key = LexOrdering::new(vec![PhysicalSortExpr {
+            expr: col("a", &schema).unwrap(),
+            options: SortOptions::default(),
+        }]);
+        let plan: Arc<dyn ExecutionPlan> =
+            single_partition_aggregate(plan, vec![("a".to_string(), "a1".to_string())]);
+        let plan = sort_exec(sort_key, plan);
+
+        // Starting plan: as in our test case.
+        assert_eq!(
+            get_plan_string(&plan),
+            vec![
+                "SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+                "  AggregateExec: mode=SinglePartitioned, gby=[a@0 as a1], aggr=[]",
+                "    CoalescePartitionsExec",
+                "      ProjectionExec: expr=[a@0 as a, b@1 as value]",
+                "        UnionExec",
+                "          ParquetExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e]",
+                "          ParquetExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e]",
+            ],
+        );
+
+        let checker = SanityCheckPlan::new().optimize(plan.clone(), &Default::default());
+        assert!(checker.is_ok());
+
+        // EnforceSorting will remove the coalesce, and add an SPM further up (above the aggregate).
+        let optimizer = EnforceSorting::new();
+        let optimized = optimizer.optimize(plan, &Default::default())?;
+        assert_eq!(
+            get_plan_string(&optimized),
+            vec![
+                "SortPreservingMergeExec: [a@0 ASC]",
+                "  SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+                "    AggregateExec: mode=SinglePartitioned, gby=[a@0 as a1], aggr=[]",
+                "      CoalescePartitionsExec",
+                "        ProjectionExec: expr=[a@0 as a, b@1 as value]",
+                "          UnionExec",
+                "            ParquetExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e]",
+                "            ParquetExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e]",
+            ],
+        );
+
+        // Plan is valid.
+        let checker = SanityCheckPlan::new();
+        let checker = checker.optimize(optimized, &Default::default());
+        assert!(checker.is_ok());
+
         Ok(())
     }
 

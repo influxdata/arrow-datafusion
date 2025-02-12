@@ -29,6 +29,7 @@ use crate::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::tree_node::PlanContext;
 
@@ -107,4 +108,9 @@ pub fn is_union(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// Checks whether the given operator is a [`RepartitionExec`].
 pub fn is_repartition(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<RepartitionExec>()
+}
+
+/// Checks whether the given operator is a [`AggregateExec`].
+pub fn is_aggregation(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.as_any().is::<AggregateExec>()
 }
