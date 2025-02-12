@@ -109,3 +109,8 @@ pub fn is_union(plan: &Arc<dyn ExecutionPlan>) -> bool {
 pub fn is_repartition(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<RepartitionExec>()
 }
+
+/// Checks whether the given operator is a [`AggregateExec`].
+pub fn is_aggregation(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.as_any().is::<AggregateExec>()
+}

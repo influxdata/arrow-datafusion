@@ -37,7 +37,7 @@
 
 use std::sync::Arc;
 
-use super::utils::{add_sort_above, add_sort_above_with_check};
+use super::utils::{add_sort_above, add_sort_above_with_check, is_aggregation};
 use crate::config::ConfigOptions;
 use crate::error::Result;
 use crate::physical_optimizer::replace_with_order_preserving_variants::{
@@ -516,7 +516,7 @@ fn remove_bottleneck_in_subplan(
 ) -> Result<PlanWithCorrespondingCoalescePartitions> {
     let plan = &requirements.plan;
     let children = &mut requirements.children;
-    if is_coalesce_partitions(&children[0].plan) {
+    if is_coalesce_partitions(&children[0].plan) && !is_aggregation(plan) {
         // We can safely use the 0th index since we have a `CoalescePartitionsExec`.
         let mut new_child_node = children[0].children.swap_remove(0);
         while new_child_node.plan.output_partitioning() == plan.output_partitioning()
@@ -2261,21 +2261,20 @@ mod tests {
             get_plan_string(&optimized),
             vec![
                 "SortPreservingMergeExec: [a@0 ASC]",
-                "  SortExec: expr=[a@0 ASC], preserve_partitioning=[true]",
+                "  SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
                 "    AggregateExec: mode=SinglePartitioned, gby=[a@0 as a1], aggr=[]",
-                "      ProjectionExec: expr=[a@0 as a, b@1 as value]",
-                "        UnionExec",
-                "          ParquetExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e]",
-                "          ParquetExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e]",
+                "      CoalescePartitionsExec",
+                "        ProjectionExec: expr=[a@0 as a, b@1 as value]",
+                "          UnionExec",
+                "            ParquetExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e]",
+                "            ParquetExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e]",
             ],
         );
 
-        // Plan is now invalid.
+        // Plan is valid.
         let checker = SanityCheckPlan::new();
-        let err = checker
-            .optimize(optimized, &Default::default())
-            .unwrap_err();
-        assert!(err.message().contains(" does not satisfy distribution requirements: HashPartitioned[[a@0]]). Child-0 output partitioning: UnknownPartitioning(2)"));
+        let checker = checker.optimize(optimized, &Default::default());
+        assert!(checker.is_ok());
 
         Ok(())
     }
