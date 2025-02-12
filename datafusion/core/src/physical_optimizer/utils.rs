@@ -29,6 +29,7 @@ use crate::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::tree_node::PlanContext;
 

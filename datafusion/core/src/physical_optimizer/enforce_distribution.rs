@@ -1584,7 +1584,7 @@ pub(crate) mod tests {
         .build_arc()
     }
 
-    fn parquet_exec_with_stats() -> Arc<ParquetExec> {
+    pub(crate) fn parquet_exec_with_stats() -> Arc<ParquetExec> {
         let mut statistics = Statistics::new_unknown(&schema());
         statistics.num_rows = Precision::Inexact(10);
         statistics.column_statistics = column_stats();
@@ -1665,7 +1665,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn projection_exec_with_alias(
+    pub(crate) fn projection_exec_with_alias(
         input: Arc<dyn ExecutionPlan>,
         alias_pairs: Vec<(String, String)>,
     ) -> Arc<dyn ExecutionPlan> {
