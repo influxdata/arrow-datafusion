@@ -19,6 +19,9 @@ use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use crate::physical_optimizer::sanity_checker::{
+    assert_sanity_check, assert_sanity_check_err,
+};
 use crate::physical_optimizer::test_utils::{
     check_integrity, coalesce_partitions_exec, repartition_exec, schema,
     sort_merge_join_exec, sort_preserving_merge_exec,
@@ -32,8 +35,9 @@ use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::{CsvSource, FileScanConfig, ParquetSource};
 use datafusion_common::error::Result;
+use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::ScalarValue;
+use datafusion_common::{ColumnStatistics, ScalarValue};
 use datafusion_expr::{JoinType, Operator};
 use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion_physical_expr::PhysicalExpr;
@@ -61,7 +65,9 @@ use datafusion_physical_plan::source::DataSourceExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::PlanProperties;
-use datafusion_physical_plan::{displayable, DisplayAs, DisplayFormatType, Statistics};
+use datafusion_physical_plan::{
+    displayable, get_plan_string, DisplayAs, DisplayFormatType, Statistics,
+};
 
 /// Models operators like BoundedWindowExec that require an input
 /// ordering but is easy to construct
@@ -184,6 +190,43 @@ fn parquet_exec_multiple_sorted(
     ])
     .with_output_ordering(output_ordering)
     .new_exec()
+}
+
+fn int64_stats() -> ColumnStatistics {
+    ColumnStatistics {
+        null_count: Precision::Absent,
+        sum_value: Precision::Absent,
+        max_value: Precision::Exact(1_000_000.into()),
+        min_value: Precision::Exact(0.into()),
+        distinct_count: Precision::Absent,
+    }
+}
+
+fn column_stats() -> Vec<ColumnStatistics> {
+    vec![
+        int64_stats(), // a
+        int64_stats(), // b
+        int64_stats(), // c
+        ColumnStatistics::default(),
+        ColumnStatistics::default(),
+    ]
+}
+
+pub(crate) fn parquet_exec_with_stats() -> Arc<DataSourceExec> {
+    let mut statistics = Statistics::new_unknown(&schema());
+    statistics.num_rows = Precision::Inexact(10);
+    statistics.column_statistics = column_stats();
+
+    let config = FileScanConfig::new(
+        ObjectStoreUrl::parse("test:///").unwrap(),
+        schema(),
+        Arc::new(ParquetSource::new(Default::default())),
+    )
+    .with_file(PartitionedFile::new("x".to_string(), 10000))
+    .with_statistics(statistics);
+    assert_eq!(config.statistics.num_rows, Precision::Inexact(10));
+
+    config.new_exec()
 }
 
 fn csv_exec() -> Arc<DataSourceExec> {
@@ -501,6 +544,53 @@ macro_rules! assert_plan_txt {
             expected_lines, actual_lines
         );
     };
+}
+
+/// Similar to [`macro_rules! assert_optimized`], but with the following:
+/// * only run the EnforceDistribution once.
+/// * then only run the EnforceSorting once.
+/// * does not force round-robin repartitioning to be inserted.
+///
+/// It also is a simplified test case, and does not handle JOINS.
+/// (Does run join key reordering, a pre-condition before distribution enforcement).
+fn assert_optimized_without_forced_roundrobin(
+    expected: &[&str],
+    plan: Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Arc<dyn ExecutionPlan> {
+    // Add the ancillary output requirements operator at the start:
+    let optimizer = OutputRequirements::new_add_mode();
+    let optimized = optimizer
+        .optimize(plan, config)
+        .expect("failed to add output req node");
+
+    let optimizer = EnforceDistribution::new();
+    let optimized = optimizer
+        .optimize(optimized, config)
+        .expect("failed distribution enforcement");
+
+    let optimizer = EnforceSorting::new();
+    let optimized = optimizer
+        .optimize(optimized, config)
+        .expect("failed sorting enforcement");
+
+    // Remove the ancillary output requirements operator when done:
+    let optimizer = OutputRequirements::new_remove_mode();
+    let optimized = optimizer
+        .optimize(optimized, config)
+        .expect("failed to remove output req node");
+
+    // Now format correctly
+    let actual_lines = get_plan_string(&optimized);
+
+    let expected_lines: Vec<&str> = expected.iter().map(|s| *s).collect();
+    assert_eq!(
+        &expected_lines, &actual_lines,
+        "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+        expected_lines, actual_lines
+    );
+
+    optimized
 }
 
 #[test]
@@ -3151,6 +3241,316 @@ fn optimize_away_unnecessary_repartition2() -> Result<()> {
     ];
     assert_optimized!(expected, physical_plan.clone(), true);
     assert_optimized!(expected, physical_plan, false);
+
+    Ok(())
+}
+
+fn aggregate_over_union(input: Vec<Arc<dyn ExecutionPlan>>) -> Arc<dyn ExecutionPlan> {
+    let union = union_exec(input);
+    let plan =
+        aggregate_exec_with_alias(union, vec![("a".to_string(), "a1".to_string())]);
+
+    // Demonstrate starting plan.
+    let before = get_plan_string(&plan);
+    assert_eq!(
+        before,
+        vec![
+            "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[]",
+            "  AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[]",
+            "    UnionExec",
+            "      DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+            "      DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        ],
+    );
+
+    plan
+}
+
+// Aggregate over a union,
+// with current testing setup.
+//
+// It will repartiton twice for an aggregate over a union.
+// * repartitions before the partial aggregate.
+// * repartitions before the final aggregation.
+#[test]
+fn repartitions_twice_for_aggregate_after_union() -> Result<()> {
+    let plan = aggregate_over_union(vec![parquet_exec(); 2]);
+
+    // We get a distribution error without repartitioning.
+    let err = "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet\"] does not satisfy distribution requirements: HashPartitioned[[a1@0]]). Child-0 output partitioning: UnknownPartitioning(2)";
+    assert_sanity_check_err(&plan, err);
+
+    // Test: using the `assert_optimized` macro.
+    //
+    // Updated plan (post optimization) will have added RepartitionExecs (btwn union and aggregation).
+    let expected = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[]",
+        "RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[]",
+        "RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
+        "UnionExec",
+        "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    assert_optimized!(expected, plan.clone(), true);
+
+    // Test: confirm changes are idempotent
+    assert_optimized!(expected, plan.clone(), false);
+
+    Ok(())
+}
+
+// Aggregate over a union,
+// but make the test setup match our real world example.
+//
+// It will still repartiton twice for an aggregate over a union.
+#[test]
+fn redo_with_new_testing_setup() -> Result<()> {
+    // use parquet exec with stats
+    let plan: Arc<dyn ExecutionPlan> =
+        aggregate_over_union(vec![parquet_exec_with_stats(); 2]);
+
+    // We get a distribution error without repartitioning.
+    let err = "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet\"] does not satisfy distribution requirements: HashPartitioned[[a1@0]]). Child-0 output partitioning: UnknownPartitioning(2)";
+    assert_sanity_check_err(&plan, err);
+
+    // Test: using the `assert_optimized_without_forced_roundrobin` macro.
+    // This removes the forced round-robin repartitioning,
+    // by no longer hard-coding batch_size=1.
+    //
+    // We get the same output as using the `assert_optimized` macro, for this base testing case.
+    let expected = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[]",
+        "  RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "    AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[]",
+        "      RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
+        "        UnionExec",
+        "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    let plan = assert_optimized_without_forced_roundrobin(
+        expected,
+        plan,
+        &ConfigOptions::default(),
+    );
+
+    // Test: confirm changes are idempotent
+    let plan = assert_optimized_without_forced_roundrobin(
+        expected,
+        plan,
+        &ConfigOptions::default(),
+    );
+
+    // Test: plan now passes sanity check.
+    assert_sanity_check(&plan, true);
+
+    Ok(())
+}
+
+/// Same as [`aggregate_over_union`], but with a sort btwn the union and aggregation.
+fn aggregate_over_sorted_union(
+    input: Vec<Arc<dyn ExecutionPlan>>,
+) -> Arc<dyn ExecutionPlan> {
+    let union = union_exec(input);
+    let schema = schema();
+    let sort_key = LexOrdering::new(vec![PhysicalSortExpr {
+        expr: col("a", &schema).unwrap(),
+        options: SortOptions::default(),
+    }]);
+    let sort = sort_exec(sort_key, union, false);
+    let plan = aggregate_exec_with_alias(sort, vec![("a".to_string(), "a1".to_string())]);
+
+    // Demonstrate starting plan.
+    // Notice the `ordering_mode=Sorted` on the aggregations.
+    let before = get_plan_string(&plan);
+    assert_eq!(
+        before,
+        vec![
+            "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+            "  AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+            "    SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+            "      UnionExec",
+            "        DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+            "        DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        ],
+    );
+
+    plan
+}
+
+/// Same starting plan as [`redo_with_new_testing_setup`],
+/// but adds a sort btwn the union and the aggregate. This changes the outcome:
+///
+/// * we still get repartitioning
+/// * we get another sort added
+/// * if we run only once, we get 2 additional sorts pushed down below the union
+#[test]
+fn repartitions_for_aggregate_after_sorted_union() -> Result<()> {
+    let plan = aggregate_over_sorted_union(vec![parquet_exec_with_stats(); 2]);
+
+    // We get a distribution error without repartitioning.
+    let err = "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet\"] does not satisfy distribution requirements: SinglePartition. Child-0 output partitioning: UnknownPartitioning(2)";
+    assert_sanity_check_err(&plan, err);
+
+    // Once we add the additional sort (in the starting plan), the optimizer run does:
+    // * add 2 RepartitionExec. Same as before.
+    // * replaces the original sort with a SPM. New change.
+    // * pushes the sort down below the union. New change.
+    // * adds another sort between the partial and final aggregates. New change.
+    let expected_after_first_run = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+        "  SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "    RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "      AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+        "        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1",
+        "          SortPreservingMergeExec: [a@0 ASC]",
+        "            UnionExec",
+        "              SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+        "                DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "              SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+        "                DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    let plan = assert_optimized_without_forced_roundrobin(
+        expected_after_first_run,
+        plan,
+        &ConfigOptions::default(),
+    );
+
+    // Demonstrate: plan changes are not idempotent.
+    //
+    // After the second run, the optimizer:
+    // * replaces the SPM with a sort, and removes the sorts pushed down below the union.
+    // * swaps the repartition vs SPM.
+    let expected_after_second_run = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+        "  SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "    RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "      AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+        "        SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
+        "            UnionExec",
+        "              DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "              DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    let plan = assert_optimized_without_forced_roundrobin(
+        expected_after_second_run,
+        plan,
+        &ConfigOptions::default(),
+    );
+
+    // Test: plan now passes sanity check.
+    assert_sanity_check(&plan, true);
+
+    Ok(())
+}
+
+/// Same as [`aggregate_over_sorted_union`], but with a projection->sort added btwn the union and aggregation.
+fn aggregate_over_sorted_union_projection(
+    input: Vec<Arc<dyn ExecutionPlan>>,
+) -> Arc<dyn ExecutionPlan> {
+    let union = union_exec(input);
+    let union_projection = projection_exec_with_alias(
+        union,
+        vec![
+            ("a".to_string(), "a".to_string()),
+            ("b".to_string(), "value".to_string()),
+        ],
+    );
+    let schema = schema();
+    let sort_key = LexOrdering::new(vec![PhysicalSortExpr {
+        expr: col("a", &schema).unwrap(),
+        options: SortOptions::default(),
+    }]);
+    let sort = sort_exec(sort_key, union_projection, false);
+    let plan = aggregate_exec_with_alias(sort, vec![("a".to_string(), "a1".to_string())]);
+
+    // Demonstrate starting plan.
+    // Notice the `ordering_mode=Sorted` on the aggregations.
+    let before = get_plan_string(&plan);
+    assert_eq!(
+        before,
+        vec![
+            "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+            "  AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+            "    SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+            "      ProjectionExec: expr=[a@0 as a, b@1 as value]",
+            "        UnionExec",
+            "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+            "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        ],
+    );
+
+    plan
+}
+
+/// Same starting plan as [`repartitions_for_aggregate_after_sorted_union`], but adds a projection
+/// as well between the union and aggregate. This change the outcome:
+///
+/// * we still get repartitioning
+/// * we still get another sort added
+/// * we no longer get 2 additional sorts pushed down below the union, after the first run
+#[test]
+fn repartitions_for_aggregate_after_sorted_union_projection() -> Result<()> {
+    let mut config = ConfigOptions::default();
+    config
+        .execution
+        .use_row_number_estimates_to_optimize_partitioning = true;
+    config.execution.batch_size = 100;
+
+    let plan = aggregate_over_sorted_union_projection(vec![parquet_exec_with_stats(); 2]);
+
+    // We get a distribution error without repartitioning.
+    let err = "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet\"] does not satisfy distribution requirements: SinglePartition. Child-0 output partitioning: UnknownPartitioning(2)";
+    assert_sanity_check_err(&plan, err);
+
+    // Once we add the additional projection (in the starting plan), the optimizer run does:
+    // * add 2 RepartitionExec. Same as before.
+    // * replaces the sort (above the union) with an SPM. Same as before.
+    // * NO LONGER pushes 2 additional sorts down below the union. New change.
+    // * adds another sort between the partial and final aggregates. Same as before.
+    let expected_after_first_run = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+        "  SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "    RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "      AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+        "        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1",
+        "          SortPreservingMergeExec: [a@0 ASC]",
+        "            SortExec: expr=[a@0 ASC], preserve_partitioning=[true]",
+        "              ProjectionExec: expr=[a@0 as a, b@1 as value]",
+        "                UnionExec",
+        "                  DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "                  DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    let plan = assert_optimized_without_forced_roundrobin(
+        expected_after_first_run,
+        plan,
+        &config,
+    );
+
+    // Demonstrate: plan changes are not idempotent.
+    //
+    // After the second run, the optimizer:
+    // * replaces the SPM with a sort.
+    let expected_after_second_run = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+        "  SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "    RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "      AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+        "        SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
+        "            ProjectionExec: expr=[a@0 as a, b@1 as value]",
+        "              UnionExec",
+        "                DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "                DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    let plan = assert_optimized_without_forced_roundrobin(
+        expected_after_second_run,
+        plan,
+        &config,
+    );
+
+    // Test: plan now passes sanity check.
+    assert_sanity_check(&plan, true);
 
     Ok(())
 }
