@@ -55,8 +55,8 @@ use tokio::macros::support::thread_rng_n;
 ///
 /// `UnionExec` combines multiple inputs with the same schema by
 /// concatenating the partitions.  It does not mix or copy data within
-/// or across partitions. Thus if the input partitions are sorted, the
-/// output partitions of the union are also sorted.
+/// or across partitions. Thus if the input partitions are all sorted,
+/// then the output partitions of the union are also sorted.
 ///
 /// For example, given a `UnionExec` of two inputs, with `N`
 /// partitions, and `M` partitions, there will be `N+M` output
@@ -197,7 +197,7 @@ impl ExecutionPlan for UnionExec {
         // function will return vec![false, true, true], indicating that we
         // preserve the orderings for the 2nd and the 3rd children.
         if let Some(output_ordering) = self.properties().output_ordering() {
-            self.inputs()
+            let maintains_input_ordering = self.inputs()
                 .iter()
                 .map(|child| {
                     if let Some(child_ordering) = child.output_ordering() {
@@ -206,10 +206,13 @@ impl ExecutionPlan for UnionExec {
                         false
                     }
                 })
-                .collect()
-        } else {
-            vec![false; self.inputs().len()]
+                .collect::<Vec<_>>();
+            // if not all inputs maintain the ordering, then the output cannot be ordered.
+            if maintains_input_ordering.iter().all(|maintains| *maintains) {
+                return maintains_input_ordering;
+            }
         }
+        vec![false; self.inputs().len()]
     }
 
     fn with_new_children(

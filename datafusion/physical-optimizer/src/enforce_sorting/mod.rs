@@ -68,9 +68,10 @@ use datafusion_physical_plan::tree_node::PlanContext;
 use datafusion_physical_plan::windows::{
     get_best_fitting_window, BoundedWindowAggExec, WindowAggExec,
 };
-use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, InputOrderMode};
+use datafusion_physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties, InputOrderMode};
 
 use itertools::izip;
+use sort_pushdown::pushdown_sorts_helper;
 
 /// This rule inspects [`SortExec`]'s in the given physical plan in order to
 /// remove unnecessary sorts, and optimize sort performance across the plan.
@@ -242,13 +243,22 @@ impl PhysicalOptimizerRule for EnforceSorting {
             .data()?;
         // Execute a top-down traversal to exploit sort push-down opportunities
         // missed by the bottom-up traversal:
-        let mut sort_pushdown = SortPushDown::new_default(updated_plan.plan);
-        assign_initial_requirements(&mut sort_pushdown);
-        let adjusted = pushdown_sorts(sort_pushdown)?;
-        adjusted
+        // println!("\nBEFORE:\n{}\n\n", displayable(updated_plan.plan.as_ref()).indent(true));
+        let mut sort_pushdown_ctx = SortPushDown::new_default(updated_plan.plan);
+        assign_initial_requirements(&mut sort_pushdown_ctx);
+        // let adjusted = pushdown_sorts(sort_pushdown)?;
+        let adjusted = sort_pushdown_ctx
+            .transform_down(pushdown_sorts_helper)
+            .data()?;
+
+        let fin = adjusted
             .plan
             .transform_up(|plan| Ok(Transformed::yes(replace_with_partial_sort(plan)?)))
-            .data()
+            .data();
+        if let Ok(fin) = &fin {
+            // println!("\nAFTER:\n{}\n\n", displayable(fin.as_ref()).indent(true));
+        }
+        fin
     }
 
     fn name(&self) -> &str {
