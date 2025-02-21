@@ -241,15 +241,17 @@ impl PhysicalOptimizerRule for EnforceSorting {
                 )
             })
             .data()?;
+    
+        println!("\nBEFORE:\n{}\n\n", displayable(updated_plan.plan.as_ref()).indent(true));
+
         // Execute a top-down traversal to exploit sort push-down opportunities
         // missed by the bottom-up traversal:
-        // println!("\nBEFORE:\n{}\n\n", displayable(updated_plan.plan.as_ref()).indent(true));
         let mut sort_pushdown_ctx = SortPushDown::new_default(updated_plan.plan);
-        assign_initial_requirements(&mut sort_pushdown_ctx);
-        // let adjusted = pushdown_sorts(sort_pushdown)?;
+        sort_pushdown_ctx = assign_initial_requirements(sort_pushdown_ctx);
         let adjusted = sort_pushdown_ctx
             .transform_down(pushdown_sorts_helper)
             .data()?;
+        println!("\nAFTER:\n{}\n\n", displayable(adjusted.plan.as_ref()).indent(true));
 
         let fin = adjusted
             .plan

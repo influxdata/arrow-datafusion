@@ -19,7 +19,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::utils::{
-    add_sort_above, is_sort, is_sort_preserving_merge, is_union, is_window,
+    add_sort_above, is_datasource, is_sort, is_sort_preserving_merge, is_union, is_window, maybe_add_sort_above
 };
 
 use arrow::datatypes::SchemaRef;
@@ -30,16 +30,19 @@ use datafusion_common::{plan_err, HashSet, JoinSide, Result};
 use datafusion_expr::JoinType;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr::PhysicalSortRequirement;
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalSortRequirement};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::{
     calculate_join_output_ordering, ColumnIndex,
 };
 use datafusion_physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
+use datafusion_physical_plan::source::DataSourceExec;
+use datafusion_physical_plan::streaming::StreamingTableExec;
 use datafusion_physical_plan::tree_node::PlanContext;
 use datafusion_physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties};
 
@@ -59,168 +62,183 @@ pub struct ParentRequirements {
 pub type SortPushDown = PlanContext<ParentRequirements>;
 
 /// Assigns the ordering requirement of the root node to the its children.
-pub fn assign_initial_requirements(node: &mut SortPushDown) {
-    let reqs = node.plan.required_input_ordering();
-    for (child, requirement) in node.children.iter_mut().zip(reqs) {
-        child.data = ParentRequirements {
-            ordering_requirement: requirement,
-            // If the parent has a fetch value, assign it to the children
-            // Or use the fetch value of the child.
-            fetch: child.plan.fetch(),
+pub fn assign_initial_requirements(node: SortPushDown) -> SortPushDown {
+    let SortPushDown {
+        children,
+        plan,
+        data,
+    } = node;
+    let reqs = plan.required_input_ordering();
+    let fetch = data.fetch;
+
+    let new_children = children.into_iter().zip(reqs).map(|(child_requirement, node_order_req)| {
+        let pushdown = ParentRequirements {
+            ordering_requirement: node_order_req,
+            fetch,
         };
+        SortPushDown::new(child_requirement.plan, pushdown, child_requirement.children)
+    }).collect();
+
+    SortPushDown::new(plan, data, new_children)
+}
+
+/// Pushdown sorts using a top-down traversal.
+pub fn pushdown_sorts(mut requirements: SortPushDown) -> Result<Transformed<SortPushDown>> {
+    if !is_sort(&requirements.plan) {
+        Ok(Transformed::no(requirements))
+    } else {
+        // perform sort pushdown:
+
+        // assign sort requirements to child
+        requirements = assign_initial_requirements(requirements);
+
+        // remove the sort itself (sort has a single child)
+        requirements = requirements.children.swap_remove(0);
+        requirements = requirements.update_plan_from_children()?;
+
+        // attempt pushdown
+        requirements.transform_down(pushdown_sorts_helper)
     }
 }
 
-// /// A 
-pub fn pushdown_sorts(sort_pushdown: SortPushDown) -> Result<SortPushDown> {
-    let mut new_node = pushdown_sorts_helper(sort_pushdown)?;
-    while new_node.tnr == TreeNodeRecursion::Stop {
-        // new_node = pushdown_sorts_helper(new_node.data)?;
-        new_node = pushdown_sorts_helper(new_node.data)?.map_data(|node| node.update_plan_from_children())?;
-    }
-    let (new_node, children) = new_node.data.take_children();
-    let new_children = children
-        .into_iter()
-        // .map(pushdown_sorts)
-        .map(|child| pushdown_sorts(child).and_then(|c| c.update_plan_from_children()))
-        .collect::<Result<_>>()?;
-    new_node.with_new_children(new_children)
-
-}
-
-/// 
+/// Pushdown sorts using a top-down traversal.
 pub fn pushdown_sorts_helper(
     mut requirements: SortPushDown,
 ) -> Result<Transformed<SortPushDown>> {
     let plan = &requirements.plan;
+    // gather the requirements assigned from the parent
     let parent_reqs = requirements
         .data
         .ordering_requirement
         .clone()
         .unwrap_or_default();
 
-    // `satisfy_parent` means that the node can provide the sort needed for the SortPushDown.
-    // This means that it does not just pass thru the previous sort, rather, that it creates
-    // the proper sort.
-    let satisfy_parent = plan
-        .equivalence_properties()
-        .ordering_satisfy_requirement(&parent_reqs);
-        // && (!plan.maintains_input_order().iter().all(|maintains| *maintains) && plan
-        // .equivalence_properties().output_ordering().is_some());
-    println!("\npushdown_sorts_helper:\n{}\nparent_requirements={:?}\nrequirements={:?}\nsatisfy_parent={:?}", displayable(plan.as_ref()).indent(true), parent_reqs, requirements.data, satisfy_parent);
+    // compare child/current plan reqs, vs parent
+    let current_eq_props = plan.equivalence_properties();
+    let child_satisfies_parent = current_eq_props.ordering_satisfy_requirement(&parent_reqs);
+    let parent_stricter_than_child = current_eq_props.output_ordering().map(|child_ordering| current_eq_props.requirements_compatible(&parent_reqs, &child_ordering.into())).unwrap_or_default();
 
-    if is_sort(plan) {
-        let sort_fetch = plan.fetch();
-        let required_ordering = plan
-            .output_ordering()
-            .cloned()
-            .map(LexRequirement::from)
-            .unwrap_or_default();
-        if !satisfy_parent {
-            // Make sure this `SortExec` satisfies parent requirements:
-            let sort_reqs = requirements.data.ordering_requirement.unwrap_or_default();
-            // It's possible current plan (`SortExec`) has a fetch value.
-            // And if both of them have fetch values, we should use the minimum one.
-            if let Some(fetch) = sort_fetch {
-                if let Some(requirement_fetch) = requirements.data.fetch {
-                    requirements.data.fetch = Some(fetch.min(requirement_fetch));
-                }
-            }
-            let fetch = requirements.data.fetch.or(sort_fetch);
-            requirements = requirements.children.swap_remove(0);
-            requirements = add_sort_above(requirements, sort_reqs, fetch);
+    // let maintains_ordering = plan.maintains_input_order().iter().all(|maintains| *maintains);
+    println!("\n\npushdown_sorts_helper:\n{}\nparent_requirements={:?}\nsatisfy_parent={:?}", displayable(plan.as_ref()).indent(true), parent_reqs, child_satisfies_parent);
+
+    if is_sort(plan) && (child_satisfies_parent || parent_stricter_than_child) {
+        println!("Case 1");
+        // Case 1: unify to a single sort order pushdown.
+        // Outcome: carry on sort pushdown with new ordering.
+
+        // If this `SortExec` satisfies parent requirements => use that.
+        // Otherwise, use stricter parent.
+        let sort_reqs = if child_satisfies_parent {
+            plan.equivalence_properties().output_ordering().expect("sort exec should have output ordering")
+        } else {
+            parent_reqs.into()
         };
 
-        // We can safely get the 0th index as we are dealing with a `SortExec`.
-        let mut child = requirements.children.swap_remove(0);
-        if let Some(adjusted) =
-            pushdown_requirement_to_children(&child.plan, &required_ordering)?
-        {
-            let fetch = sort_fetch.or_else(|| child.plan.fetch());
-            for (grand_child, order) in child.children.iter_mut().zip(adjusted) {
-                grand_child.data = ParentRequirements {
-                    ordering_requirement: order,
+        // It's possible current plan (`SortExec`) has a fetch value.
+        // And if both of them have fetch values, we should use the minimum one.
+        let sort_fetch = plan.fetch();
+        if let Some(fetch) = sort_fetch {
+            if let Some(requirement_fetch) = requirements.data.fetch {
+                requirements.data.fetch = Some(fetch.min(requirement_fetch));
+            }
+        }
+        let fetch = requirements.data.fetch.or(sort_fetch);
+
+        // remove current sort
+        requirements = requirements.children.swap_remove(0); // sort exec has only 1 input
+        requirements = requirements.update_plan_from_children()?;
+
+        // reset requirements
+        requirements.data.fetch = fetch;
+        requirements.data.ordering_requirement = Some(sort_reqs.into());
+
+        // call same function again, now with sort removed
+        requirements = assign_initial_requirements(requirements);
+        pushdown_sorts_helper(requirements)
+    } else if is_sort(plan) {
+        println!("Case 2, add sort");
+        // Case 2: we have a new sort to push down.
+        // Outcome: (1) add back current sort being pushed down
+        // Outcome: (2) continue pushdown with new sort
+
+        assert!(!parent_reqs.is_empty(), "should have parent ordering requirements, since no requirement would be satisfied");
+        let fetch = requirements.data.fetch;
+        requirements = add_sort_above(requirements, parent_reqs, fetch);
+        requirements = requirements.update_plan_from_children()?;
+        // on next transform_down, it will hit `Case 1` for the new sort to push
+
+        // Reset the parent requirements on the children
+        // which should be no ordering required, since is current node is a sort
+        requirements = assign_initial_requirements(requirements); // given child node requirements for this sort
+        Ok(Transformed::yes(requirements))
+    } else if parent_reqs.is_empty() || (is_sort_preserving_merge(plan) && child_satisfies_parent) {
+        println!("Case 3");
+        // Case 3: we are not pushing down a sort. Continue down to find the next sort.
+        requirements = assign_initial_requirements(requirements);
+        Ok(Transformed::no(requirements))
+    } else if let Some(adjusted_ordering_reqs) =
+    pushdown_requirement_to_children(&plan, &parent_reqs)? {
+            println!("Case 4");
+            // Case 4: can continue current sort pushdown
+            let fetch = requirements.data.fetch;
+    
+            // Update requirements with the children's ordering requirements (which may be stricter)
+            let children = std::mem::take(&mut requirements.children);
+            let new_children = children.into_iter().zip(adjusted_ordering_reqs).map(|(child_requirement, child_order_req)| {
+                let pushdown = ParentRequirements {
+                    ordering_requirement: child_order_req,
                     fetch,
                 };
-            }
-
-            // Can push down requirements
-            child.data = ParentRequirements {
-                ordering_requirement: Some(required_ordering),
-                fetch,
-            };
-
-            return Ok(Transformed {
-                data: child,
-                transformed: true,
-                tnr: TreeNodeRecursion::Continue,
-            });
-        } else {
-            // Can not push down requirements
-            requirements.children = vec![child];
-            assign_initial_requirements(&mut requirements);
-        }
-    } else if satisfy_parent {
-        println!("ushdown_sorts_helper => A");
-        // For non-sort operators, immediately return if parent requirements are met:
-        let reqs = plan.required_input_ordering();
-        for (child, order) in requirements.children.iter_mut().zip(reqs) {
-            child.data.ordering_requirement = order;
-        }
-    } else if plan.maintains_input_order().iter().all(|maintains| *maintains) {
-        if let Some(adjusted) = pushdown_requirement_to_children(plan, &parent_reqs)? {
-            println!("ushdown_sorts_helper => B");
-            // Can not satisfy the parent requirements, check whether we can push
-            // requirements down:
-            for (child, order) in requirements.children.iter_mut().zip(adjusted) {
-                child.data.ordering_requirement = order;
-            }
-            requirements.data.ordering_requirement = None;
-        } else {
-            println!("pushdown_sorts_helper => C");
-            // Can not push down requirements, add new `SortExec`:
-            let sort_reqs = requirements
-                .data
-                .ordering_requirement
-                .clone()
-                .unwrap_or_default();
-            let fetch = requirements.data.fetch;
-            requirements = add_sort_above(requirements, sort_reqs, fetch);
-            assign_initial_requirements(&mut requirements);
-            return Ok(Transformed {
-                data: requirements,
-                transformed: true,
-                tnr: TreeNodeRecursion::Jump,
-            });
-        }
+                SortPushDown::new(child_requirement.plan, pushdown, child_requirement.children)
+            }).collect();
+            requirements.children = new_children;
+            requirements = requirements.update_plan_from_children()?;
+    
+            Ok(Transformed::yes(requirements))
     } else {
-        println!("pushdown_sorts_helper => C");
-        // Can not push down requirements, add new `SortExec`:
-        let sort_reqs = requirements
-            .data
-            .ordering_requirement
-            .clone()
-            .unwrap_or_default();
+        println!("Case 5, add sort");
+        // Case 5: we have performed the current pushdown as far as possible.
+        // Outcome: add back the sort being pushed down
+
+        assert!(!parent_reqs.is_empty(), "should have carried sort order requirements");
         let fetch = requirements.data.fetch;
-        requirements = add_sort_above(requirements, sort_reqs, fetch);
-        assign_initial_requirements(&mut requirements);
-        return Ok(Transformed {
-            data: requirements,
-            transformed: true,
-            tnr: TreeNodeRecursion::Jump,
-        });
+
+        requirements = maybe_add_sort_above(requirements, parent_reqs, fetch);
+
+        // this should set the requirements for subplan
+        requirements = assign_initial_requirements(requirements);
+        Ok(Transformed::yes(requirements))
     }
-    Ok(Transformed::yes(requirements))
 }
 
-/// Pushdown sort requirements to children.
+/// Calculate the pushdown ordering requirements for children.
+/// 
 /// If sort cannot be pushed down, return None.
+/// 
+/// If sort can be pushed down, return the sort requirements of the chilren
+/// which may be more stringent than the parent's needs.
 fn pushdown_requirement_to_children(
     plan: &Arc<dyn ExecutionPlan>,
     parent_required: &LexRequirement,
 ) -> Result<Option<Vec<Option<LexRequirement>>>> {
-    println!("pushdown_requirement_to_children for {}", plan.name());
+    let output_req = LexRequirement::from(
+        plan.properties()
+            .output_ordering()
+            .cloned()
+            .unwrap_or(LexOrdering::default()),
+    );
+    let is_satisfied = plan
+        .properties()
+        .eq_properties
+        .ordering_satisfy_requirement(&parent_required);
+    let parent_is_stricter = plan
+        .properties()
+        .eq_properties
+        .requirements_compatible(parent_required, &output_req);
     let maintains_input_order = plan.maintains_input_order();
+
+    println!("pushdown_requirement_to_children for {}, is_satisfied={:?}", plan.name(), is_satisfied);
+
     if is_window(plan) {
         let required_input_ordering = plan.required_input_ordering();
         let request_child = required_input_ordering[0].clone().unwrap_or_default();
@@ -236,19 +254,8 @@ fn pushdown_requirement_to_children(
             RequirementsCompatibility::Compatible(adjusted) => Ok(Some(vec![adjusted])),
             RequirementsCompatibility::NonCompatible => Ok(None),
         }
-    } else if let Some(sort_exec) = plan.as_any().downcast_ref::<SortExec>() {
-        let sort_req = LexRequirement::from(
-            sort_exec
-                .properties()
-                .output_ordering()
-                .cloned()
-                .unwrap_or(LexOrdering::default()),
-        );
-        if sort_exec
-            .properties()
-            .eq_properties
-            .requirements_compatible(parent_required, &sort_req)
-        {
+    } else if is_sort(&plan) {
+        if parent_is_stricter {
             debug_assert!(!parent_required.is_empty());
             Ok(Some(vec![Some(LexRequirement::new(
                 parent_required.to_vec(),
@@ -258,26 +265,21 @@ fn pushdown_requirement_to_children(
         }
     } else if plan.fetch().is_some()
         && plan.supports_limit_pushdown()
-        && plan
-            .maintains_input_order()
-            .iter()
-            .all(|maintain| *maintain)
+        && maintains_input_order.iter().all(|maintain| *maintain)
     {
-        println!("A => pushdown thru {}", plan.name());
-        let output_req = LexRequirement::from(
-            plan.properties()
-                .output_ordering()
-                .cloned()
-                .unwrap_or(LexOrdering::default()),
-        );
+        // println!("A => pushdown thru {}", plan.name());
         // Push down through operator with fetch when:
         // - requirement is aligned with output ordering
         // - it preserves ordering during execution
-        if plan
-            .properties()
-            .eq_properties
-            .requirements_compatible(parent_required, &output_req)
-        {
+        if is_satisfied || parent_is_stricter {
+            let req = (!parent_required.is_empty())
+                .then(|| LexRequirement::new(parent_required.to_vec()));
+            Ok(Some(vec![req]))
+        } else {
+            Ok(None)
+        }
+    } else if is_datasource(plan) || plan.as_any().is::<StreamingTableExec>() {
+        if is_satisfied {
             let req = (!parent_required.is_empty())
                 .then(|| LexRequirement::new(parent_required.to_vec()));
             Ok(Some(vec![req]))
@@ -330,7 +332,7 @@ fn pushdown_requirement_to_children(
         || plan.as_any().is::<ProjectionExec>()
         || pushdown_would_violate_requirements(parent_required, plan.as_ref())
     {
-        println!("B => down't pushdown {}", plan.name());
+        println!("B => don't pushdown {}", plan.name());
         // If the current plan is a leaf node or can not maintain any of the input ordering, can not pushed down requirements.
         // For RepartitionExec, we always choose to not push down the sort requirements even the RepartitionExec(input_partition=1) could maintain input ordering.
         // Pushing down is not beneficial

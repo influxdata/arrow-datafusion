@@ -25,10 +25,27 @@ use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::source::DataSourceExec;
 use datafusion_physical_plan::tree_node::PlanContext;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+
+/// Similar to [`add_sort_above`], except it only adds a `SortExec` above
+/// is the sort expression is not empty after consideration of constants.
+pub fn maybe_add_sort_above<T: Clone + Default>(
+    node: PlanContext<T>,
+    sort_requirements: LexRequirement,
+    fetch: Option<usize>,
+) -> PlanContext<T> {
+    let mut sort = add_sort_above(node, sort_requirements, fetch);
+
+    if sort.plan.output_ordering().map(|orderings| orderings.is_empty()).unwrap_or(true) {
+        sort.children.swap_remove(0)
+    } else {
+        sort
+    }
+}
 
 /// This utility function adds a `SortExec` above an operator according to the
 /// given ordering requirements while preserving the original partitioning.
@@ -110,4 +127,9 @@ pub fn is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// i.e. either a [`LocalLimitExec`] or a [`GlobalLimitExec`].
 pub fn is_limit(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<GlobalLimitExec>() || plan.as_any().is::<LocalLimitExec>()
+}
+
+/// Checks whether the given operator is a [`DataSourceExec`].
+pub fn is_datasource(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.as_any().is::<DataSourceExec>()
 }

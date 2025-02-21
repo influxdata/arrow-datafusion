@@ -42,7 +42,7 @@ use datafusion_physical_expr::Partitioning;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_optimizer::enforce_sorting::{EnforceSorting,PlanWithCorrespondingCoalescePartitions,PlanWithCorrespondingSort,parallelize_sorts,ensure_sorting};
 use datafusion_physical_optimizer::enforce_sorting::replace_with_order_preserving_variants::{replace_with_order_preserving_variants,OrderPreservationContext};
-use datafusion_physical_optimizer::enforce_sorting::sort_pushdown::{SortPushDown, assign_initial_requirements, pushdown_sorts};
+use datafusion_physical_optimizer::enforce_sorting::sort_pushdown::{SortPushDown, assign_initial_requirements, pushdown_sorts_helper};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -163,8 +163,8 @@ macro_rules! assert_optimized {
             // TODO: End state payloads will be checked here.
 
             let mut sort_pushdown = SortPushDown::new_default(updated_plan.plan);
-            assign_initial_requirements(&mut sort_pushdown);
-            check_integrity(pushdown_sorts(sort_pushdown)?)?;
+            sort_pushdown = assign_initial_requirements(sort_pushdown);
+            check_integrity(sort_pushdown.transform_down(pushdown_sorts_helper)?.data)?;
             // TODO: End state payloads will be checked here.
         }
 
@@ -1487,8 +1487,8 @@ macro_rules! assert_optimized {
             // TODO: End state payloads will be checked here.
 
             let mut sort_pushdown = SortPushDown::new_default(updated_plan.plan);
-            assign_initial_requirements(&mut sort_pushdown);
-            check_integrity(pushdown_sorts(sort_pushdown)?)?;
+            sort_pushdown = assign_initial_requirements(sort_pushdown);
+            check_integrity(sort_pushdown.transform_down(pushdown_sorts_helper)?.data)?;
             // TODO: End state payloads will be checked here.
         }
 
