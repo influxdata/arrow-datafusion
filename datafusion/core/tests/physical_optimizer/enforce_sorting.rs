@@ -17,6 +17,12 @@
 
 use std::sync::Arc;
 
+use crate::physical_optimizer::enforce_distribution::{
+    parquet_exec_with_stats, projection_exec_with_alias,
+};
+use crate::physical_optimizer::sanity_checker::{
+    assert_sanity_check, assert_sanity_check_err,
+};
 use crate::physical_optimizer::test_utils::{
     aggregate_exec, bounded_window_exec, bounded_window_exec_non_set_monotonic,
     bounded_window_exec_with_partition, check_integrity, coalesce_batches_exec,
@@ -28,6 +34,7 @@ use crate::physical_optimizer::test_utils::{
     spr_repartition_exec, stream_exec_ordered, union_exec, RequirementsTestExec,
 };
 
+use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion_physical_plan::displayable;
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
@@ -54,6 +61,8 @@ use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::sorts::sort::SortExec;
 
 use rstest::rstest;
+
+use super::test_utils::schema;
 
 /// Create a csv exec for tests
 fn csv_exec_ordered(
@@ -2278,5 +2287,87 @@ async fn test_not_replaced_with_partial_sort_for_unbounded_input() -> Result<()>
     ];
     let expected_no_change = expected_input;
     assert_optimized!(expected_input, expected_no_change, physical_plan, true);
+    Ok(())
+}
+
+fn single_partition_aggregate(
+    input: Arc<dyn ExecutionPlan>,
+    alias_pairs: Vec<(String, String)>,
+) -> Arc<dyn ExecutionPlan> {
+    let schema = schema();
+    let group_by = alias_pairs
+        .iter()
+        .map(|(column, alias)| (col(column, &input.schema()).unwrap(), alias.to_string()))
+        .collect::<Vec<_>>();
+    let group_by = PhysicalGroupBy::new_single(group_by);
+
+    Arc::new(
+        AggregateExec::try_new(
+            AggregateMode::SinglePartitioned,
+            group_by,
+            vec![],
+            vec![],
+            input,
+            schema,
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn test_preserve_needed_coalesce() -> Result<()> {
+    // Input to EnforceSorting, from our test case.
+    let plan = projection_exec_with_alias(
+        union_exec(vec![parquet_exec_with_stats(); 2]),
+        vec![
+            ("a".to_string(), "a".to_string()),
+            ("b".to_string(), "value".to_string()),
+        ],
+    );
+    let plan = Arc::new(CoalescePartitionsExec::new(plan));
+    let schema = schema();
+    let sort_key = LexOrdering::new(vec![PhysicalSortExpr {
+        expr: col("a", &schema).unwrap(),
+        options: SortOptions::default(),
+    }]);
+    let plan: Arc<dyn ExecutionPlan> =
+        single_partition_aggregate(plan, vec![("a".to_string(), "a1".to_string())]);
+    let plan = sort_exec(sort_key, plan);
+
+    // Starting plan: as in our test case.
+    assert_eq!(
+        get_plan_string(&plan),
+        vec![
+            "SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+            "  AggregateExec: mode=SinglePartitioned, gby=[a@0 as a1], aggr=[]",
+            "    CoalescePartitionsExec",
+            "      ProjectionExec: expr=[a@0 as a, b@1 as value]",
+            "        UnionExec",
+            "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+            "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        ],
+    );
+    assert_sanity_check(&plan, true);
+
+    // EnforceSorting will remove the coalesce, and add an SPM further up (above the aggregate).
+    let optimizer = EnforceSorting::new();
+    let optimized = optimizer.optimize(plan, &Default::default())?;
+    assert_eq!(
+        get_plan_string(&optimized),
+        vec![
+            "SortPreservingMergeExec: [a@0 ASC]",
+            "  SortExec: expr=[a@0 ASC], preserve_partitioning=[true]",
+            "    AggregateExec: mode=SinglePartitioned, gby=[a@0 as a1], aggr=[]",
+            "      ProjectionExec: expr=[a@0 as a, b@1 as value]",
+            "        UnionExec",
+            "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+            "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        ],
+    );
+
+    // Plan is now invalid.
+    let err = "does not satisfy distribution requirements: HashPartitioned[[a@0]]). Child-0 output partitioning: UnknownPartitioning(2)";
+    assert_sanity_check_err(&optimized, err);
+
     Ok(())
 }
