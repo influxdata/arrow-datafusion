@@ -34,6 +34,7 @@ pub mod limit_pushdown;
 pub mod limited_distinct_aggregation;
 pub mod optimizer;
 pub mod output_requirements;
+pub mod progressive_evaluation;
 pub mod projection_pushdown;
 pub mod pruning;
 pub mod sanity_checker;
