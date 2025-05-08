@@ -20,14 +20,16 @@
 use arrow::array::ArrayRef;
 use arrow::compute::SortOptions;
 use arrow::row::{Row, RowConverter, Rows, SortField};
-use datafusion_common::{error::DataFusionError, Result, ScalarValue};
+use datafusion_common::{internal_err, DataFusionError, Result, ScalarValue};
 use std::fmt::Display;
 use std::sync::Arc;
 
+/// Represents a range of sort key values within a lexical space.
+///
 /// # Lexical Space
 ///
-/// The "Lexical Space" is all possible values of a sort order (set of sort
-/// expressions).
+/// The "Lexical Space" is all possible values of columns in a sort order (set
+/// of sort expressions).
 ///
 /// For example, given data with a sort order of `A ASC, B ASC`
 /// (`A` ascending, `B` ascending), then the lexical space is all the unique
@@ -35,31 +37,46 @@ use std::sync::Arc;
 ///
 /// # Lexical Range
 ///
-/// The "lexical range" of an input in this lexical space is
-/// the minimum and maximum sort key values for that range.
+/// The "lexical range" is defined by two points in a lexical space (the
+/// minimum and maximum sort key values for some range)
 ///
 /// For example, for data like
-/// | `a` | `b` |
-/// |--------|--------|
+///
+/// |`a`| `b` |
+/// |---|-----|
 /// | 1 | 100 |
 /// | 1 | 200 |
 /// | 1 | 300 |
 /// | 2 | 100 |
 /// | 2 | 200 |
-/// | 3 | 50 |
+/// | 3 | 50  |
 ///
-/// The lexical range is `min --> max`: `(1,100) --> (3,50)`
+/// The lexical range is
+/// * `min --> max`
+/// * `(a_min, b_min) -> (a_max, b_max)`
+/// * `(1,100) --> (3,50)`
 #[derive(Debug, Default, Clone)]
 pub struct LexicalRange {
-    /// The minimum value in the lexical space (one for each sort key)
+    /// The minimum multi-column value in the lexical space (one `ScalarValue`
+    /// for each sort key)
     min: Vec<ScalarValue>,
-    /// The maximum value in the lexical space (one for each sort key)
+    /// The maximum multi-column value in the lexical space (one `ScalarValue`
+    /// for each sort key)
     max: Vec<ScalarValue>,
 }
 
 impl LexicalRange {
+    /// Create a [`LexicalRangeBuilder`]
     pub fn builder() -> LexicalRangeBuilder {
         LexicalRangeBuilder::new()
+    }
+
+    /// Create a new [`LexicalRange`] with the same min and max values.
+    pub fn new_from_constants(constants: Vec<ScalarValue>) -> Self {
+        Self {
+            min: constants.clone(),
+            max: constants,
+        }
     }
 }
 
@@ -83,6 +100,8 @@ impl Display for LexicalRange {
 }
 
 /// Builder for [`LexicalRange`]
+///
+/// This builds up a multi-column min/max range one pair at a time.
 #[derive(Debug, Default, Clone)]
 pub struct LexicalRangeBuilder {
     inner: LexicalRange,
@@ -97,24 +116,48 @@ impl LexicalRangeBuilder {
         self.inner
     }
 
-    /// Adds min and max to the end of the in-progress ranges
+    /// Adds a min and max to the end of the in-progress ranges
     pub fn push(&mut self, min: ScalarValue, max: ScalarValue) {
         self.inner.min.push(min);
         self.inner.max.push(max);
     }
 }
 
-/// Represents ranges of lexically ordered values in a sort order.
+/// Represents a set of non overlapping [`LexicalRange`]s ordered according to
+/// minimum value.
 ///
-/// One element for each input partition
-
+/// # Single Column
+///
+/// For example given a set of ranges
+/// ```text
+/// (11, 20)  // partition 0
+/// (1,  10)  // partition 1
+/// (21, 30)  // partition 2
+/// ```
+///
+/// Then `[1, 0, 2]` is a non-overlapping ordered set of lexical ranges. When
+/// ordered by minimum value: `(1, 10)` comes first, then `(11, 20)` and then
+/// `(21, 30)`.
+///
+/// There are no `NonOverlappingOrderedLexicalRanges` if the ranges are not
+/// disjoint (they overlap). For example, the following ranges overlap between
+/// 11 and 15:
+///
+/// ```text
+/// (11, 20)  // partition 0
+/// (1,  15)  // partition 1
+/// ```
+///
 #[derive(Debug)]
 pub struct NonOverlappingOrderedLexicalRanges {
-    /// Corresponding lexical range per partition, already reordered to match indices
+    /// lexical ranges.
+    ///
+    /// These are typically used to represent the value ranges of each
+    /// DataFusion (not IOx) partition
     value_ranges: Vec<LexicalRange>,
 
-    /// The order of the input partitions (rows of ranges) that would provide ensure they are
-    /// sorted in lexical order
+    /// Indexes into `value_ranges` that define a non overlapping ordering by
+    /// minimum value.
     indices: Vec<usize>,
 }
 
@@ -125,35 +168,31 @@ impl Display for NonOverlappingOrderedLexicalRanges {
 }
 
 impl NonOverlappingOrderedLexicalRanges {
-    /// Attempt to create a new [`NonOverlappingOrderedLexicalRanges`]
+    /// Attempt to create a new [`NonOverlappingOrderedLexicalRanges`] given the
+    /// specified [`SortOptions`].
+    ///
+    /// See struct documentation for more details
     ///
     /// Returns None if:
     /// * - There are no ranges
-    /// * - The ranges are not disjoint (aka they overlap in the lexical space)
+    /// * - The ranges are overlap in lexical space (are not disjoint)
     ///
-    /// Returns Err if there is an error converting values
+    /// Returns Err if there is an error converting values.
     pub fn try_new(
         sort_options: &[SortOptions],
-        ranges_per_partition: Vec<LexicalRange>,
+        value_ranges: Vec<LexicalRange>,
     ) -> Result<Option<Self>> {
-        if ranges_per_partition.is_empty() {
+        if value_ranges.is_empty() {
             return Ok(None);
         }
-        // convert to min/maxes, as VecPerPartition<VecPerSortKey>
-        let (mins, maxes) = ranges_per_partition.clone().into_iter().fold(
-            (vec![], vec![]),
-            |(mut mins, mut maxes), partition_range| {
-                let LexicalRange {
-                    min: min_per_sort_key,
-                    max: max_per_sort_key,
-                } = partition_range;
-                mins.push(min_per_sort_key);
-                maxes.push(max_per_sort_key);
-                (mins, maxes)
-            },
-        );
-        let rows = ConvertedRows::try_new(sort_options, mins, maxes)?;
 
+        // convert to rows, for row ordering per sort key
+        let rows = ConvertedRows::try_new_from_lexical_ranges(
+            sort_options,
+            value_ranges.clone(),
+        )?;
+
+        // order by minimum value
         let mut indices = (0..rows.num_rows()).collect::<Vec<_>>();
         indices.sort_by_key(|&i| rows.min_row(i));
 
@@ -162,47 +201,30 @@ impl NonOverlappingOrderedLexicalRanges {
             return Ok(None);
         };
 
-        // reorder lexical ranges
-        let mut value_ranges = ranges_per_partition
-            .into_iter()
-            .enumerate()
-            .map(|(input_partition_idx, range)| {
-                let reordering_idx = indices
-                    .iter()
-                    .position(|reorder_idx| *reorder_idx == input_partition_idx)
-                    .expect("missing partition in reordering indices");
-                (reordering_idx, range)
-            })
-            .collect::<Vec<_>>();
-        value_ranges.sort_by_key(|(reord_i, _)| *reord_i);
-
-        let value_ranges = value_ranges
-            .into_iter()
-            .map(|(_, range)| range)
-            .collect::<Vec<_>>();
-
         Ok(Some(Self {
             value_ranges,
             indices,
         }))
     }
 
-    /// Returns the indices that describe the order input partitions must be reordered
-    /// to be non overlapping and ordered in lexical order.
+    /// Indices that define an ordered list of non overlapping value ranges.
     pub fn indices(&self) -> &[usize] {
         &self.indices
     }
 
-    /// Returns the lexical ranges already re-ordered
-    pub fn value_ranges(&self) -> &[LexicalRange] {
-        &self.value_ranges
+    /// Iterator over the in lexical ranges in order
+    pub fn ordered_ranges(&self) -> impl Iterator<Item = &LexicalRange> {
+        self.indices.iter().map(|i| &self.value_ranges[*i])
     }
 }
 
 /// Result of converting multiple-column ScalarValue rows to columns.
 #[derive(Debug)]
 struct ConvertedRows {
-    /// Use the same row converter for mins and maxes, otherwise they cannot be compared.
+    /// converter for mins and maxes
+    ///
+    /// Must use the same conveted rows for both, otherwise they cannot be
+    /// compared.
     converter: RowConverter,
 
     mins: Rows,
@@ -218,8 +240,20 @@ impl ConvertedRows {
         min_keys: Vec<Vec<ScalarValue>>,
         max_keys: Vec<Vec<ScalarValue>>,
     ) -> Result<Self> {
-        assert_eq!(sort_options.len(), min_keys[0].len());
-        assert_eq!(sort_options.len(), max_keys[0].len());
+        if sort_options.len() != min_keys[0].len() {
+            return internal_err!(
+                "Expected number of sort options ({}) to match number of sort keys in min_keys ({})",
+                sort_options.len(),
+                min_keys[0].len()
+            );
+        }
+        if sort_options.len() != max_keys[0].len() {
+            return internal_err!(
+                "Expected number of sort options ({}) to match number of sort keys in max_keys ({})",
+                sort_options.len(),
+                max_keys.len()
+            );
+        }
 
         // build converter using min keys
         let arrays = pivot_to_arrays(min_keys)?;
@@ -244,21 +278,45 @@ impl ConvertedRows {
         })
     }
 
+    fn try_new_from_lexical_ranges(
+        sort_options: &[SortOptions],
+        lexical_ranges: Vec<LexicalRange>,
+    ) -> Result<Self> {
+        // convert to min/maxes, as VecPerPartition<VecPerSortKey>
+        let (mins, maxes) = lexical_ranges.clone().into_iter().fold(
+            (vec![], vec![]),
+            |(mut mins, mut maxes), partition_range| {
+                let LexicalRange {
+                    min: min_per_sort_key,
+                    max: max_per_sort_key,
+                } = partition_range;
+                mins.push(min_per_sort_key);
+                maxes.push(max_per_sort_key);
+                (mins, maxes)
+            },
+        );
+        Self::try_new(sort_options, mins, maxes)
+    }
+
+    /// Return the number of partitions (rows) in the converted rows.
     fn num_rows(&self) -> usize {
         self.mins.num_rows()
     }
 
-    /// Return the min (as Row) at the specified index
+    /// Return the min (as [`Row`]) at the specified index
     fn min_row(&self, index: usize) -> Row<'_> {
         self.mins.row(index)
     }
 
-    /// Return the max (as Row) at the specified index
+    /// Return the max (as [`Row`]) at the specified index
     fn max_row(&self, index: usize) -> Row<'_> {
         self.maxes.row(index)
     }
 
-    /// Return the min value at the specified index
+    /// Return the min value at the specified index as a list of single
+    /// row arrays
+    ///
+    /// Used for debugging
     fn min_value(&self, index: usize) -> Result<Vec<ArrayRef>> {
         let values = self
             .converter
@@ -267,7 +325,10 @@ impl ConvertedRows {
         Ok(values.iter().map(Arc::clone).collect::<Vec<_>>())
     }
 
-    /// Return the max value at the specified index
+    /// Return the max value at the specified index as a list of single
+    /// row arrays
+    ///
+    /// Used for debugging
     fn max_value(&self, index: usize) -> Result<Vec<ArrayRef>> {
         let values = self
             .converter
@@ -276,7 +337,20 @@ impl ConvertedRows {
         Ok(values.iter().map(Arc::clone).collect::<Vec<_>>())
     }
 
-    // Return true if ranges are disjoint when order according to ordered_partition_idx.
+    /// Return true if ranges are disjoint assuming the ranges are sorted by
+    /// `ordered_by_min_partition_indices`
+    ///
+    /// This checks each pair of adjacent ranges in the sorted order.
+    ///
+    /// (0 -> 10)  (11 -> 20)  (21 -> 30) => disjoint=true
+    ///      output = true
+    ///
+    /// (0 -> 10)  (10 -> 20)  (21 -> 30) => disjoint=true because 10==10 and does not invalidate the ordering
+    ///      output = true
+    ///
+    /// (0 -> 13)  (12 -> 20)  (21 -> 30) => disjoint=false
+    ///      output = None
+    ///
     fn are_disjoint(&self, ordered_by_min_partition_indices: &[usize]) -> bool {
         for index_index in 1..ordered_by_min_partition_indices.len() {
             let index = ordered_by_min_partition_indices[index_index];
@@ -285,9 +359,10 @@ impl ConvertedRows {
             // Ordering is by sort key, and may be desc.
             // Therefore need to confirm that the min & max of the current range is greater than the previous range.
             let start_exclusive = self.min_row(index) > self.min_row(prev_index)
-                && self.min_row(index) > self.max_row(prev_index);
-            let end_exclusive = self.max_row(index) > self.min_row(prev_index)
+                && self.min_row(index) >= self.max_row(prev_index);
+            let end_exclusive = self.max_row(index) >= self.min_row(prev_index)
                 && self.max_row(index) > self.max_row(prev_index);
+
             if !(start_exclusive && end_exclusive) {
                 return false;
             }
@@ -312,11 +387,9 @@ fn pivot_to_arrays(keys: Vec<Vec<ScalarValue>>) -> Result<Vec<ArrayRef>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use arrow::compute::SortOptions;
-    use datafusion_common::ScalarValue;
     use itertools::Itertools;
-
-    use super::{LexicalRange, NonOverlappingOrderedLexicalRanges};
 
     struct TestCase {
         partitions: Vec<TestPartition>,
@@ -329,6 +402,7 @@ mod tests {
 
     impl TestCase {
         fn run(self) {
+            println!("Beginning test : {}", self.name);
             // Test: confirm found proper lexical ranges
             let lexical_ranges = self.build_lexical_ranges();
             let expected = self
@@ -353,13 +427,19 @@ mod tests {
                 TestSortOption::DescNullsFirst,
                 TestSortOption::DescNullsLast,
             ].into_iter().for_each(|sort_ordering| {
-                if let Some(nonoverlapping) = NonOverlappingOrderedLexicalRanges::try_new(&sort_ordering.sort_options(self.num_sort_keys).as_slice(), lexical_ranges.clone()).expect("should not error") {
-                    assert!(self.expect_disjoint, "ERROR {} for {:?}: expected ranges to overlap, instead found disjoint ranges", self.name, &sort_ordering);
+                if let Some(nonoverlapping) = NonOverlappingOrderedLexicalRanges::try_new(&sort_ordering.sort_options(self.num_sort_keys), lexical_ranges.clone()).expect("should not error") {
+                    assert!(self.expect_disjoint,
+                            "ERROR {} for {:?}: expected ranges to overlap, instead found disjoint ranges",
+                            self.name, &sort_ordering);
 
                     let expected_ordered_indices = self.find_expected_indices(&sort_ordering);
-                    assert_eq!(expected_ordered_indices, nonoverlapping.indices(), "ERROR {} for {:?}: expected to find indices ordered {:?}, instead found ordering {:?}", self.name, &sort_ordering, expected_ordered_indices, nonoverlapping.indices());
+                    assert_eq!(expected_ordered_indices, nonoverlapping.indices(),
+                               "ERROR {} for {:?}: expected to find indices ordered {:?}, instead found ordering {:?}",
+                               self.name, &sort_ordering, expected_ordered_indices, nonoverlapping.indices());
                 } else {
-                    assert!(!self.expect_disjoint, "ERROR {} for {:?}: expected to find disjoint ranges, instead could either not detect ranges or found overlapping ranges", self.name, &sort_ordering);
+                    assert!(!self.expect_disjoint,
+                            "ERROR {} for {:?}: expected to find disjoint ranges, instead could either not detect ranges or found overlapping ranges",
+                            self.name, &sort_ordering);
                 };
             });
         }
@@ -407,9 +487,13 @@ mod tests {
         TestPartition { range_per_sort_key }
     }
 
+    /// Build min/maxes for a partition with three sort keys:
+    /// 1. An integer sort key
+    /// 2. A string sort key
+    /// 3. A timestamp sort key (nanoseconds)
     fn build_partition_with_multiple_sort_keys(
         ints: (Option<i64>, Option<i64>),
-        strings: (Option<String>, Option<String>),
+        strings: (Option<&str>, Option<&str>),
         times: (Option<i64>, Option<i64>),
     ) -> TestPartition {
         let range_per_sort_key = vec![
@@ -418,8 +502,8 @@ mod tests {
                 max: ScalarValue::Int64(ints.1),
             },
             SortKeyRange {
-                min: ScalarValue::Utf8(strings.0),
-                max: ScalarValue::Utf8(strings.1),
+                min: ScalarValue::from(strings.0),
+                max: ScalarValue::from(strings.1),
             },
             SortKeyRange {
                 min: ScalarValue::TimestampNanosecond(times.0, None),
@@ -541,17 +625,17 @@ mod tests {
                 partitions: vec![
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(10)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(1), Some(1)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(2), Some(10)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(1), Some(1)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(0), Some(0)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(1), Some(1)),
                     ),
                 ],
@@ -569,17 +653,17 @@ mod tests {
                 partitions: vec![
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(10)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(1), Some(1)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(11), Some(20)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(1), Some(1)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(0), Some(0)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(1), Some(1)),
                     ),
                 ],
@@ -603,17 +687,17 @@ mod tests {
                 partitions: vec![
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("a".into()), Some("d".into())),
+                        (Some("a"), Some("d")),
                         (Some(1), Some(1)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("f".into()), Some("g".into())),
+                        (Some("f"), Some("g")),
                         (Some(1), Some(1)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("c".into()), Some("e".into())),
+                        (Some("c"), Some("e")),
                         (Some(1), Some(1)),
                     ),
                 ],
@@ -631,17 +715,17 @@ mod tests {
                 partitions: vec![
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("a".into()), Some("b".into())),
+                        (Some("a"), Some("b")),
                         (Some(1), Some(1)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("f".into()), Some("g".into())),
+                        (Some("f"), Some("g")),
                         (Some(1), Some(1)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("c".into()), Some("e".into())),
+                        (Some("c"), Some("e")),
                         (Some(1), Some(1)),
                     ),
                 ],
@@ -665,17 +749,17 @@ mod tests {
                 partitions: vec![
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(50000000), Some(50000001)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(700000), Some(50000001)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(100000000), Some(100000001)),
                     ),
                 ],
@@ -693,17 +777,17 @@ mod tests {
                 partitions: vec![
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(50000000), Some(50000001)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(700000), Some(7000001)),
                     ),
                     build_partition_with_multiple_sort_keys(
                         (Some(1), Some(1)),
-                        (Some("same".into()), Some("same".into())),
+                        (Some("same"), Some("same")),
                         (Some(100000000), Some(100000001)),
                     ),
                 ],
@@ -765,6 +849,165 @@ mod tests {
                     (TestSortOption::AscNullsLast, vec![0, 1, 2]).into(),
                     (TestSortOption::DescNullsFirst, vec![2, 1, 0]).into(),
                     (TestSortOption::DescNullsLast, vec![1, 0, 2]).into(),
+                ],
+            },
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(1), Some(1)),
+                        (None, Some("e")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(1), Some(1)),
+                        (Some("e"), None),
+                        (Some(1), Some(1)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "order_by_nulls__overlap",
+                expected_ranges_per_partition: vec![
+                    "(1,NULL,1)->(1,e,1)",
+                    "(1,e,1)->(1,NULL,1)",
+                ],
+                expect_disjoint: false,
+                expected_ordered_indices: vec![],
+            },
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(20)),
+                        (None, Some("c")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(21), Some(22)),
+                        (Some("e"), Some("f")),
+                        (Some(2), Some(3)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "order_by_nulls__disjoint2",
+                expected_ranges_per_partition: vec![
+                    "(10,NULL,1)->(20,c,1)",
+                    "(21,e,2)->(22,f,3)",
+                ],
+                expect_disjoint: true,
+                expected_ordered_indices: vec![
+                    (TestSortOption::AscNullsFirst, vec![0, 1]).into(),
+                    (TestSortOption::AscNullsLast, vec![0, 1]).into(),
+                    (TestSortOption::DescNullsFirst, vec![1, 0]).into(),
+                    (TestSortOption::DescNullsLast, vec![1, 0]).into(),
+                ],
+            },
+        ];
+
+        cases.into_iter().for_each(|test_case| test_case.run());
+    }
+
+    #[test]
+    fn test_disjointness_with_touching_disjoint_ranges() {
+        let cases = [
+            /* Using the first sort key, an integer, and has a start(current)==end(previous). */
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(1), Some(10)), // ends with 10
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(20)), // starts with 10
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(0), Some(0)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "order_by_first_sort_key__disjoint_touching",
+                expected_ranges_per_partition: vec![
+                    "(1,same,1)->(10,same,1)",
+                    "(10,same,1)->(20,same,1)",
+                    "(0,same,1)->(0,same,1)",
+                ],
+                expect_disjoint: true,
+                expected_ordered_indices: vec![
+                    (TestSortOption::AscNullsFirst, vec![2, 0, 1]).into(),
+                    (TestSortOption::AscNullsLast, vec![2, 0, 1]).into(),
+                    (TestSortOption::DescNullsFirst, vec![1, 0, 2]).into(),
+                    (TestSortOption::DescNullsLast, vec![1, 0, 2]).into(),
+                ],
+            },
+            /* Using the middle sort key, a string, as the decider, and has a start(current)==end(previous) */
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(1), Some(1)),
+                        (Some("a"), Some("c")), // ends with c
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(1), Some(1)),
+                        (Some("f"), Some("g")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(1), Some(1)),
+                        (Some("c"), Some("e")), // starts with c
+                        (Some(1), Some(1)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "order_by_middle_sort_key__disjoint_touching",
+                expected_ranges_per_partition: vec![
+                    "(1,a,1)->(1,c,1)",
+                    "(1,f,1)->(1,g,1)",
+                    "(1,c,1)->(1,e,1)",
+                ],
+                expect_disjoint: true,
+                expected_ordered_indices: vec![
+                    (TestSortOption::AscNullsFirst, vec![0, 2, 1]).into(),
+                    (TestSortOption::AscNullsLast, vec![0, 2, 1]).into(),
+                    (TestSortOption::DescNullsFirst, vec![1, 2, 0]).into(),
+                    (TestSortOption::DescNullsLast, vec![1, 2, 0]).into(),
+                ],
+            },
+            /* Using the last sort key, a nanosecond timestamp, as the decider, and has a start(current)==end(previous) */
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(1), Some(1)),
+                        (Some("same"), Some("same")),
+                        (Some(50000000), Some(50000001)), // ends with 50000001
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(1), Some(1)),
+                        (Some("same"), Some("same")),
+                        (Some(700000), Some(7000001)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(1), Some(1)),
+                        (Some("same"), Some("same")),
+                        (Some(50000001), Some(100000001)), // starts with 50000001
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "order_by_last_sort_key__disjoint_touching",
+                expected_ranges_per_partition: vec![
+                    "(1,same,50000000)->(1,same,50000001)",
+                    "(1,same,700000)->(1,same,7000001)",
+                    "(1,same,50000001)->(1,same,100000001)",
+                ],
+                expect_disjoint: true,
+                expected_ordered_indices: vec![
+                    (TestSortOption::AscNullsFirst, vec![1, 0, 2]).into(),
+                    (TestSortOption::AscNullsLast, vec![1, 0, 2]).into(),
+                    (TestSortOption::DescNullsFirst, vec![2, 0, 1]).into(),
+                    (TestSortOption::DescNullsLast, vec![2, 0, 1]).into(),
                 ],
             },
         ];

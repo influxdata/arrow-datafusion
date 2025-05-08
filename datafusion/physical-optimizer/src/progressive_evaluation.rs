@@ -18,6 +18,7 @@
 //! TODO: physical optimizer run to conditionally swap the SPM with the ProgressiveEvalExec
 
 mod extract_ranges;
+#[allow(dead_code)]
 mod lexical_ranges;
 mod statistics;
 mod util;

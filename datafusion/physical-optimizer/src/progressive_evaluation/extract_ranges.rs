@@ -19,8 +19,9 @@
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::Schema;
-use datafusion_common::tree_node::TreeNode;
-use datafusion_common::{ColumnStatistics, Result, ScalarValue};
+use datafusion_common::{
+    internal_datafusion_err, ColumnStatistics, Result, ScalarValue, Statistics,
+};
 use datafusion_datasource::PartitionedFile;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::LexOrdering;
@@ -28,7 +29,7 @@ use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::sync::Arc;
 
 use super::lexical_ranges::{LexicalRange, NonOverlappingOrderedLexicalRanges};
-use super::statistics::{column_statistics_min_max, PartitionStatisticsVisitor};
+use super::statistics::{column_statistics_min_max, statistics_by_partition};
 
 /// Attempt to extract LexicalRanges for the given sort keys and input plan
 ///
@@ -50,22 +51,31 @@ pub fn extract_disjoint_ranges_from_plan(
 
     let num_input_partitions = partition_count(input_plan);
 
-    // one builder for each output partition
+    // One builder for each output partition.
+    // Each builder will contain multiple sort keys
     let mut builders = vec![LexicalRange::builder(); num_input_partitions];
+
+    // get partitioned stats for the plan
+    // TODO: this will be replace with the `ExecutionPlan::statistics_by_partition`, but it doesn't yet cover our
+    // use cases. (It does cover joins, which we don't address.)
+    let partitioned_stats = statistics_by_partition(input_plan.as_ref())?;
+
+    // add per sort key
     for sort_expr in exprs.iter() {
         let Some(column) = sort_expr.expr.as_any().downcast_ref::<Column>() else {
             return Ok(None);
         };
-        let col_name = column.name();
+        let Ok(col_idx) = input_plan.schema().index_of(column.name()) else {
+            return Ok(None);
+        };
 
-        for (partition, builder) in
-            builders.iter_mut().enumerate().take(num_input_partitions)
+        // add per partition
+        for (builder, stats_for_partition) in builders.iter_mut().zip(&partitioned_stats)
         {
-            let Some((min, max)) = min_max_for_partition(
-                col_name,
+            let Some((min, max)) = min_max_for_stats_with_sort_options(
+                col_idx,
                 &sort_expr.options,
-                partition,
-                input_plan,
+                stats_for_partition,
             )?
             else {
                 return Ok(None);
@@ -87,57 +97,52 @@ fn partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
     plan.output_partitioning().partition_count()
 }
 
-/// Returns the min and max value for the specified partition.
+// Returns the min and max value for the [`Statistics`],
+/// and handles null values based on [`SortOptions`].
 ///
-/// Eventually this would be represented by the Statistics structure in
-/// DataFusion.
-fn min_max_for_partition(
-    col_name: &str,
+/// Returns None if statistics are absent/unknown.
+fn min_max_for_stats_with_sort_options(
+    col_idx: usize,
     sort_options: &SortOptions,
-    partition: usize,
-    plan: &Arc<dyn ExecutionPlan>,
+    stats: &Statistics,
 ) -> Result<Option<(ScalarValue, ScalarValue)>> {
     // Check if the column is a constant value according to the equivalence properties (TODO)
 
-    let mut extractor = PartitionStatisticsVisitor::new(col_name, partition);
-    plan.visit(&mut extractor)?;
-    let stats = extractor.result();
-
-    if let Some(ColumnStatistics {
-        min_value,
+    let Some(ColumnStatistics {
         max_value,
+        min_value,
         null_count,
         ..
-    }) = stats
-    {
-        let (Some(min), Some(max)) = (min_value.get_value(), max_value.get_value())
-        else {
-            return Ok(None);
-        };
+    }) = stats.column_statistics.get(col_idx)
+    else {
+        return Err(internal_datafusion_err!(
+            "extracted statistics is missing @{:?}, only has {:?} columns",
+            col_idx,
+            stats.column_statistics.len()
+        ));
+    };
 
-        let mut min = min.clone();
-        let mut max = max.clone();
-        if *null_count.get_value().unwrap_or(&0) > 0 {
-            let nulls_as_min = !sort_options.descending && sort_options.nulls_first // ASC nulls first
-                || sort_options.descending && !sort_options.nulls_first; // DESC nulls last
+    let (Some(min), Some(max)) = (min_value.get_value(), max_value.get_value()) else {
+        return Ok(None);
+    };
 
-            // TODO(wiedld): use ScalarValue::Null after using type coersion in ConvertedRows?
-            // For now, return None if fails to convert.
-            let Some(null) = use_scalar_none(&min) else {
-                return Ok(None);
-            };
+    let mut min = min.clone();
+    let mut max = max.clone();
+    if *null_count.get_value().unwrap_or(&0) > 0 {
+        let nulls_as_min = !sort_options.descending && sort_options.nulls_first // ASC nulls first
+    || sort_options.descending && !sort_options.nulls_first; // DESC nulls last
 
-            if nulls_as_min {
-                min = null;
-            } else {
-                max = null;
-            }
+        // Get the typed null value for the data type of min/max
+        let null: ScalarValue = min.data_type().try_into()?;
+
+        if nulls_as_min {
+            min = null;
+        } else {
+            max = null;
         }
-
-        Ok(Some((min, max)))
-    } else {
-        Ok(None)
     }
+
+    Ok(Some((min, max)))
 }
 
 /// Attempt to extract LexicalRanges for the given sort keys and partitioned files
@@ -195,706 +200,485 @@ fn min_max_for_partitioned_file(
     Ok(column_statistics_min_max(col_stats))
 }
 
-/// TODO: remove this function.
-///
-/// This is due to our [`ConvertedRows`] not yet handling type coersion of [`ScalarValue::Null`].
-fn use_scalar_none(value: &ScalarValue) -> Option<ScalarValue> {
-    match value {
-        ScalarValue::Boolean(_) => Some(ScalarValue::Boolean(None)),
-        ScalarValue::Float16(_) => Some(ScalarValue::Float16(None)),
-        ScalarValue::Float32(_) => Some(ScalarValue::Float32(None)),
-        ScalarValue::Float64(_) => Some(ScalarValue::Float64(None)),
-        ScalarValue::Decimal128(_, a, b) => Some(ScalarValue::Decimal128(None, *a, *b)),
-        ScalarValue::Decimal256(_, a, b) => Some(ScalarValue::Decimal256(None, *a, *b)),
-        ScalarValue::Int8(_) => Some(ScalarValue::Int8(None)),
-        ScalarValue::Int16(_) => Some(ScalarValue::Int16(None)),
-        ScalarValue::Int32(_) => Some(ScalarValue::Int32(None)),
-        ScalarValue::Int64(_) => Some(ScalarValue::Int64(None)),
-        ScalarValue::UInt8(_) => Some(ScalarValue::UInt8(None)),
-        ScalarValue::UInt16(_) => Some(ScalarValue::UInt16(None)),
-        ScalarValue::UInt32(_) => Some(ScalarValue::UInt32(None)),
-        ScalarValue::UInt64(_) => Some(ScalarValue::UInt64(None)),
-        ScalarValue::Utf8(_) => Some(ScalarValue::Utf8(None)),
-        ScalarValue::Utf8View(_) => Some(ScalarValue::Utf8View(None)),
-        ScalarValue::LargeUtf8(_) => Some(ScalarValue::LargeUtf8(None)),
-        ScalarValue::Binary(_) => Some(ScalarValue::Binary(None)),
-        ScalarValue::BinaryView(_) => Some(ScalarValue::BinaryView(None)),
-        ScalarValue::FixedSizeBinary(i, _) => {
-            Some(ScalarValue::FixedSizeBinary(*i, None))
-        }
-        ScalarValue::LargeBinary(_) => Some(ScalarValue::LargeBinary(None)),
-        ScalarValue::Date32(_) => Some(ScalarValue::Date32(None)),
-        ScalarValue::Date64(_) => Some(ScalarValue::Date64(None)),
-        ScalarValue::Time32Second(_) => Some(ScalarValue::Time32Second(None)),
-        ScalarValue::Time32Millisecond(_) => Some(ScalarValue::Time32Millisecond(None)),
-        ScalarValue::Time64Microsecond(_) => Some(ScalarValue::Time64Microsecond(None)),
-        ScalarValue::Time64Nanosecond(_) => Some(ScalarValue::Time64Nanosecond(None)),
-        ScalarValue::TimestampSecond(_, tz) => {
-            Some(ScalarValue::TimestampSecond(None, tz.clone()))
-        }
-        ScalarValue::TimestampMillisecond(_, tz) => {
-            Some(ScalarValue::TimestampMillisecond(None, tz.clone()))
-        }
-        ScalarValue::TimestampMicrosecond(_, tz) => {
-            Some(ScalarValue::TimestampMicrosecond(None, tz.clone()))
-        }
-        ScalarValue::TimestampNanosecond(_, tz) => {
-            Some(ScalarValue::TimestampNanosecond(None, tz.clone()))
-        }
-        ScalarValue::IntervalYearMonth(_) => Some(ScalarValue::IntervalYearMonth(None)),
-        ScalarValue::IntervalDayTime(_) => Some(ScalarValue::IntervalDayTime(None)),
-        ScalarValue::IntervalMonthDayNano(_) => {
-            Some(ScalarValue::IntervalMonthDayNano(None))
-        }
-        ScalarValue::DurationSecond(_) => Some(ScalarValue::DurationSecond(None)),
-        ScalarValue::DurationMillisecond(_) => {
-            Some(ScalarValue::DurationMillisecond(None))
-        }
-        ScalarValue::DurationMicrosecond(_) => {
-            Some(ScalarValue::DurationMicrosecond(None))
-        }
-        ScalarValue::DurationNanosecond(_) => Some(ScalarValue::DurationNanosecond(None)),
-
-        // for now, don't support others.
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::cmp;
-
     use super::*;
+    use crate::progressive_evaluation::util::test_utils::{
+        parquet_exec_with_sort_with_statistics,
+        parquet_exec_with_sort_with_statistics_and_schema, sort_exec, union_exec,
+        SortKeyRange,
+    };
+    use std::fmt::{Debug, Display, Formatter};
 
-    use arrow::{
-        compute::SortOptions,
-        datatypes::{DataType, Field},
-    };
-    use datafusion_common::{stats::Precision, ColumnStatistics, Statistics};
-    use datafusion_datasource::{
-        file_groups::FileGroup, file_scan_config::FileScanConfigBuilder,
-        source::DataSourceExec,
-    };
-    use datafusion_datasource_parquet::source::ParquetSource;
-    use datafusion_execution::object_store::ObjectStoreUrl;
+    use arrow::compute::SortOptions;
+    use arrow::datatypes::{DataType, Field};
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
-    use datafusion_physical_plan::{
-        expressions::col, sorts::sort::SortExec, union::UnionExec,
-    };
-    use itertools::Itertools;
+    use datafusion_physical_plan::displayable;
+    use datafusion_physical_plan::expressions::col;
 
-    struct KeyRange {
-        min: Option<i32>,
-        max: Option<i32>,
-        null_count: usize,
+    use insta::assert_snapshot;
+
+    /// test with three partition ranges that are disjoint (non overlapping)
+    fn test_case_disjoint_3() -> TestCaseBuilder {
+        TestCaseBuilder::new()
+            .with_key_range(SortKeyRange {
+                min: Some(1000),
+                max: Some(2000),
+                null_count: 0,
+            })
+            .with_key_range(SortKeyRange {
+                min: Some(2001),
+                max: Some(3000),
+                null_count: 0,
+            })
+            .with_key_range(SortKeyRange {
+                min: Some(3001),
+                max: Some(3500),
+                null_count: 0,
+            })
     }
 
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]))
+    /// test with three partition ranges that are NOT disjoint (are overlapping)
+    fn test_case_overlapping_3() -> TestCaseBuilder {
+        TestCaseBuilder::new()
+            .with_key_range(SortKeyRange {
+                min: Some(1000),
+                max: Some(2010),
+                null_count: 0,
+            })
+            .with_key_range(SortKeyRange {
+                min: Some(2001),
+                max: Some(3000),
+                null_count: 0,
+            })
+            .with_key_range(SortKeyRange {
+                min: Some(3001),
+                max: Some(3500),
+                null_count: 0,
+            })
     }
 
-    /// Create a single parquet
-    fn parquet_exec_with_sort_with_statistics(
-        output_ordering: Vec<LexOrdering>,
-        key_ranges: &[&KeyRange],
-    ) -> Arc<dyn ExecutionPlan> {
-        let mut statistics = Statistics::new_unknown(&schema());
-        let mut file_groups = Vec::with_capacity(key_ranges.len());
+    #[test]
+    fn test_union_sort_union_disjoint_ranges_asc() {
+        assert_snapshot!(
+        test_case_disjoint_3()
+            .with_descending(false)
+            .with_sort_expr("a")
+            .union_sort_union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
+            UnionExec
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
-        let mut cum_null_count = 0;
-        let mut cum_min = None;
-        let mut cum_max = None;
-        for key_range in key_ranges {
-            let KeyRange {
-                min,
-                max,
-                null_count,
-            } = key_range;
+        Input Ranges
+          (Some(1000))->(Some(2000))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        Output Ranges: [0, 1]
+          (1000)->(2000)
+          (2001)->(3500)
+        ");
+    }
 
-            // update cummulative statistics for entire parquet exec
-            cum_min = match (cum_min, min) {
-                (None, x) => *x,
-                (x, None) => x,
-                (Some(a), Some(b)) => Some(cmp::min(a, *b)),
-            };
-            cum_max = match (cum_max, max) {
-                (None, x) => *x,
-                (x, None) => x,
-                (Some(a), Some(b)) => Some(cmp::max(a, *b)),
-            };
-            cum_null_count += *null_count;
+    #[test]
+    fn test_union_sort_union_overlapping_ranges_asc() {
+        assert_snapshot!(
+         test_case_overlapping_3()
+            .with_descending(false)
+            .with_sort_expr("a")
+            .union_sort_union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
+            UnionExec
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
-            // Create file with statistics.
-            let mut file = PartitionedFile::new("x".to_string(), 100);
-            let stats = Statistics {
-                num_rows: Precision::Absent,
-                total_byte_size: Precision::Absent,
-                column_statistics: vec![ColumnStatistics {
-                    null_count: Precision::Exact(*null_count),
-                    min_value: Precision::Exact(ScalarValue::Int32(*min)),
-                    max_value: Precision::Exact(ScalarValue::Int32(*max)),
-                    ..Default::default()
-                }],
-            };
-            file.statistics = Some(Arc::new(stats.clone()));
-            file_groups.push(FileGroup::new(vec![file]).with_statistics(stats));
+        Input Ranges
+          (Some(1000))->(Some(2010))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        No disjoint ranges found
+        ");
+    }
+
+    #[test]
+    fn test_union_sort_union_disjoint_ranges_desc_nulls_first() {
+        assert_snapshot!(
+        test_case_disjoint_3()
+            .with_descending(true)
+            .with_sort_expr("a")
+            .union_sort_union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+          SortExec: expr=[a@0 DESC], preserve_partitioning=[false]
+            UnionExec
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+
+        Input Ranges
+          (Some(1000))->(Some(2000))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        Output Ranges: [1, 0]
+          (2001)->(3500)
+          (1000)->(2000)
+        ");
+    }
+
+    #[test]
+    fn test_union_sort_union_overlapping_ranges_desc_nulls_first() {
+        assert_snapshot!(
+         test_case_overlapping_3()
+            .with_descending(true)
+            .with_sort_expr("a")
+            .union_sort_union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+          SortExec: expr=[a@0 DESC], preserve_partitioning=[false]
+            UnionExec
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+
+        Input Ranges
+          (Some(1000))->(Some(2010))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        No disjoint ranges found
+        ");
+    }
+
+    // default is NULLS FIRST so try NULLS LAST
+    #[test]
+    fn test_union_sort_union_disjoint_ranges_asc_nulls_last() {
+        assert_snapshot!(
+        test_case_disjoint_3()
+            .with_descending(false)
+            .with_nulls_first(false)
+            .with_sort_expr("a")
+            .union_sort_union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
+          SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
+            UnionExec
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
+
+        Input Ranges
+          (Some(1000))->(Some(2000))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        Output Ranges: [0, 1]
+          (1000)->(2000)
+          (2001)->(3500)
+        ");
+    }
+
+    // default is NULLS FIRST so try NULLS LAST
+    #[test]
+    fn test_union_sort_union_overlapping_ranges_asc_nulls_last() {
+        assert_snapshot!(
+         test_case_overlapping_3()
+            .with_descending(false)
+            .with_nulls_first(false)
+            .with_sort_expr("a")
+            .union_sort_union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
+          SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
+            UnionExec
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
+
+        Input Ranges
+          (Some(1000))->(Some(2010))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        No disjoint ranges found
+        ");
+    }
+
+    #[test]
+    fn test_union_disjoint_ranges_asc() {
+        assert_snapshot!(
+         test_case_disjoint_3()
+            .with_descending(false)
+            .with_sort_expr("a")
+            .union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+
+        Input Ranges
+          (Some(1000))->(Some(2000))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        Output Ranges: [0, 1, 2]
+          (1000)->(2000)
+          (2001)->(3000)
+          (3001)->(3500)
+        ");
+    }
+
+    #[test]
+    fn test_union_overlapping_ranges_asc() {
+        assert_snapshot!(
+         test_case_overlapping_3()
+            .with_descending(false)
+            .with_sort_expr("a")
+            .union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+
+        Input Ranges
+          (Some(1000))->(Some(2010))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        No disjoint ranges found
+        ");
+    }
+
+    #[test]
+    fn test_union_disjoint_ranges_desc() {
+        assert_snapshot!(
+         test_case_disjoint_3()
+            .with_descending(true)
+            .with_sort_expr("a")
+            .union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+
+        Input Ranges
+          (Some(1000))->(Some(2000))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        Output Ranges: [2, 1, 0]
+          (3001)->(3500)
+          (2001)->(3000)
+          (1000)->(2000)
+        ");
+    }
+
+    #[test]
+    fn test_union_overlapping_ranges_desc() {
+        assert_snapshot!(
+         test_case_overlapping_3()
+            .with_descending(true)
+            .with_sort_expr("a")
+            .union_plan(),
+         @r"
+        UnionExec
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+
+        Input Ranges
+          (Some(1000))->(Some(2010))
+          (Some(2001))->(Some(3000))
+          (Some(3001))->(Some(3500))
+        No disjoint ranges found
+        ");
+    }
+
+    /// Helper for building up patterns for testing statistics extraction from
+    /// ExecutionPlans
+    #[derive(Debug)]
+    struct TestCaseBuilder {
+        input_ranges: Vec<SortKeyRange>,
+        sort_options: SortOptions,
+        sort_exprs: Vec<PhysicalSortExpr>,
+        schema: Arc<Schema>,
+    }
+
+    impl TestCaseBuilder {
+        /// Creates a new `TestCaseBuilder` instance with default values.
+        fn new() -> Self {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+
+            Self {
+                input_ranges: vec![],
+                sort_options: SortOptions::default(),
+                sort_exprs: vec![],
+                schema,
+            }
         }
 
-        // add stats, for the whole parquet exec, for a single column
-        statistics.column_statistics[0] = ColumnStatistics {
-            null_count: Precision::Exact(cum_null_count),
-            min_value: Precision::Exact(ScalarValue::Int32(cum_min)),
-            max_value: Precision::Exact(ScalarValue::Int32(cum_max)),
-            ..Default::default()
-        };
+        /// Add a key range
+        pub fn with_key_range(mut self, key_range: SortKeyRange) -> Self {
+            self.input_ranges.push(key_range);
+            self
+        }
 
-        let config = Arc::new(
-            FileScanConfigBuilder::new(
-                ObjectStoreUrl::parse("test:///").unwrap(),
-                schema(),
-                Arc::new(ParquetSource::new(Default::default())),
-            )
-            .with_file_groups(file_groups)
-            .with_output_ordering(output_ordering)
-            .with_statistics(statistics)
-            .build(),
-        );
+        /// set SortOptions::descending flag
+        pub fn with_descending(mut self, descending: bool) -> Self {
+            self.sort_options.descending = descending;
+            self
+        }
 
-        Arc::new(DataSourceExec::new(config))
+        /// set SortOptions::nulls_first flag
+        pub fn with_nulls_first(mut self, nulls_first: bool) -> Self {
+            self.sort_options.nulls_first = nulls_first;
+            self
+        }
+
+        /// Add a sort expression to the ordering (created with the current SortOptions)
+        pub fn with_sort_expr(mut self, column_name: &str) -> Self {
+            let expr = PhysicalSortExpr::new(
+                col(column_name, &self.schema).unwrap(),
+                self.sort_options,
+            );
+            self.sort_exprs.push(expr);
+            self
+        }
+
+        /// Build a test physical plan like the following, and extract disjoint ranges from it:
+        ///
+        /// ```text
+        /// UNION
+        ///     ParquetExec (key_ranges[0])            (range_a)
+        ///     SORT
+        ///         UNION
+        ///             ParquetExec (key_ranges[1])    (range_b_1)
+        ///             ParquetExec (key_ranges[2])    (range_b_2)
+        /// ```
+        fn union_sort_union_plan(self) -> TestResult {
+            let Self {
+                input_ranges,
+                sort_options: _, // used to create sort exprs, nothere
+                sort_exprs,
+                schema,
+            } = self;
+            let lex_ordering = LexOrdering::new(sort_exprs);
+
+            assert_eq!(input_ranges.len(), 3);
+            let range_a = &input_ranges[0];
+            let range_b_1 = &input_ranges[1];
+            let range_b_2 = &input_ranges[2];
+
+            let datasrc_a = parquet_exec_with_sort_with_statistics_and_schema(
+                &schema,
+                vec![lex_ordering.clone()],
+                &[range_a],
+            );
+
+            let datasrc_b1 = parquet_exec_with_sort_with_statistics_and_schema(
+                &schema,
+                vec![lex_ordering.clone()],
+                &[range_b_1],
+            );
+            let datasrc_b2 = parquet_exec_with_sort_with_statistics_and_schema(
+                &schema,
+                vec![lex_ordering.clone()],
+                &[range_b_2],
+            );
+            let b = sort_exec(
+                &lex_ordering,
+                &union_exec(vec![datasrc_b1, datasrc_b2]),
+                false,
+            );
+
+            let plan = union_exec(vec![datasrc_a, b]);
+
+            let actual = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)
+                .expect("Error extracting disjoint ranges from plan");
+            TestResult {
+                input_ranges,
+                plan,
+                actual,
+            }
+        }
+
+        /// Build a test physical plan like the following, and extract disjoint ranges from it:
+        ///
+        /// ```text
+        /// UNION
+        ///     ParquetExec (key_ranges[0])                (range_a)
+        ///     ParquetExec (key_ranges[1], key_ranges[2]) (range_b_1, range_b_2)
+        /// ```
+        fn union_plan(self) -> TestResult {
+            let Self {
+                input_ranges,
+                sort_options: _, // used to create sort exprs, nothere
+                sort_exprs,
+                schema,
+            } = self;
+
+            let lex_ordering = LexOrdering::new(sort_exprs);
+
+            assert_eq!(input_ranges.len(), 3);
+            let range_a = &input_ranges[0];
+            let range_b_1 = &input_ranges[1];
+            let range_b_2 = &input_ranges[2];
+            let datasrc_a = parquet_exec_with_sort_with_statistics(
+                vec![lex_ordering.clone()],
+                &[range_a],
+            );
+            let datasrc_b = parquet_exec_with_sort_with_statistics_and_schema(
+                &schema,
+                vec![lex_ordering.clone()],
+                &[range_b_1, range_b_2],
+            );
+
+            let plan = union_exec(vec![datasrc_a, datasrc_b]);
+
+            let actual = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)
+                .expect("Error extracting disjoint ranges from plan");
+            TestResult {
+                input_ranges,
+                plan,
+                actual,
+            }
+        }
     }
 
-    fn union_exec(input: Vec<Arc<dyn ExecutionPlan>>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(UnionExec::new(input))
+    /// Result of running a test case, including the input ranges, the execution
+    /// plan, and the actual disjoint ranges found.
+    ///
+    /// This struct implements `Display` to provide a formatted output of the
+    /// test case results that can be easily compared using `insta` snapshots.
+    struct TestResult {
+        input_ranges: Vec<SortKeyRange>,
+        plan: Arc<dyn ExecutionPlan>,
+        actual: Option<NonOverlappingOrderedLexicalRanges>,
     }
 
-    fn sort_exec(
-        sort_exprs: LexOrdering,
-        input: Arc<dyn ExecutionPlan>,
-        preserve_partitioning: bool,
-    ) -> Arc<dyn ExecutionPlan> {
-        let new_sort = SortExec::new(sort_exprs, input)
-            .with_preserve_partitioning(preserve_partitioning);
-        Arc::new(new_sort)
-    }
+    impl TestResult {}
 
-    fn str_lexical_ranges(lex_ranges: &[LexicalRange]) -> String {
-        lex_ranges
-            .iter()
-            .map(|lr| lr.to_string())
-            .collect_vec()
-            .join(", ")
-    }
+    impl Display for TestResult {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            let displayable_plan = displayable(self.plan.as_ref()).indent(false);
+            writeln!(f, "{}", displayable_plan)?;
 
-    /// Build a test physical plan like:
-    /// UNION
-    ///     ParquetExec (range_a)
-    ///     SORT
-    ///         UNION
-    ///             ParquetExec (range_b_1)
-    ///             ParquetExec (range_b_2)
-    fn build_test_case(
-        ordering: &LexOrdering,
-        key_ranges: &[KeyRange; 3],
-    ) -> Arc<dyn ExecutionPlan> {
-        let [range_a, range_b_1, range_b_2] = key_ranges;
+            writeln!(f, "Input Ranges")?;
+            for range in &self.input_ranges {
+                writeln!(f, "  {}", range)?;
+            }
 
-        let datasrc_a =
-            parquet_exec_with_sort_with_statistics(vec![ordering.clone()], &[range_a]);
-
-        let datasrc_b1 =
-            parquet_exec_with_sort_with_statistics(vec![ordering.clone()], &[range_b_1]);
-        let datasrc_b2 =
-            parquet_exec_with_sort_with_statistics(vec![ordering.clone()], &[range_b_2]);
-        let b = sort_exec(
-            ordering.clone(),
-            union_exec(vec![datasrc_b1, datasrc_b2]),
-            false,
-        );
-
-        union_exec(vec![datasrc_a, b])
-    }
-
-    #[test]
-    fn test_extract_disjoint_ranges() -> Result<()> {
-        let plan_ranges_disjoint = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 0,
-            },
-        ];
-        let plan_ranges_overlapping = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2010),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 0,
-            },
-        ];
-
-        // Test: ASC, is disjoint (not overlapping)
-        // (1000)->(2000), (2001)->(3500)
-        let options = SortOptions {
-            descending: false,
-            ..Default::default()
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_disjoint);
-        let Some(actual) = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?
-        else {
-            unreachable!("should find disjoint")
-        };
-        assert_eq!(actual.indices(), &[0, 1], "should find proper ordering");
-        assert_eq!(
-            format!("{}", str_lexical_ranges(actual.value_ranges())),
-            "(1000)->(2000), (2001)->(3500)",
-            "should find proper ranges"
-        );
-
-        // Test: ASC, is overlapping
-        // (1000)->(2010), (2001)->(3500)
-        let options = SortOptions {
-            descending: false,
-            ..Default::default()
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_overlapping);
-        let actual = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?;
-        assert!(actual.is_none(), "should not find disjoint range");
-
-        // Test: DESC, is disjoint (not overlapping)
-        // (2001)->(3500), (1000)->(2000)
-        let options = SortOptions {
-            descending: true,
-            ..Default::default()
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_disjoint);
-        let Some(actual) = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?
-        else {
-            unreachable!("should find disjoint")
-        };
-        assert_eq!(actual.indices(), &[1, 0], "should find proper ordering"); // NOTE THE INVERSE ORDER
-        assert_eq!(
-            format!("{}", str_lexical_ranges(actual.value_ranges())),
-            "(2001)->(3500), (1000)->(2000)",
-            "should find proper ranges"
-        );
-
-        // Test: DESC, is overlapping
-        // (2001)->(3500), (1000)->(2010)
-        let options = SortOptions {
-            descending: false,
-            ..Default::default()
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_overlapping);
-        let actual = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?;
-        assert!(actual.is_none(), "should not find disjoint range");
-
-        Ok(())
-    }
-
-    /// Same as `test_extract_disjoint_ranges`, but include nulls first.
-    #[test]
-    fn test_extract_disjoint_ranges_nulls_first() -> Result<()> {
-        // NULL is min_value if ASC
-        let plan_ranges_disjoint_if_asc = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 1, // null is min value
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 0,
-            },
-        ];
-        let plan_ranges_overlap_if_asc = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 1, // null is min value, this will be overlapping
-            },
-        ];
-
-        // NULL is max_value if DESC
-        let plan_ranges_disjoint_if_desc = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 1, // null is max value
-            },
-        ];
-        let plan_ranges_overlap_if_desc = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 1, // null is max value, this will be overlapping
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 0,
-            },
-        ];
-
-        // Test: ASC, is disjoint (not overlapping)
-        // (1000)->(2000), (2001)->(3500), and partition<(1000)->(2000)> has the NULL (min value)
-        let options = SortOptions {
-            descending: false,
-            nulls_first: true,
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_disjoint_if_asc);
-        let Some(actual) = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?
-        else {
-            unreachable!("should find disjoint")
-        };
-        assert_eq!(actual.indices(), &[0, 1], "should find proper ordering");
-        assert_eq!(
-            format!("{}", str_lexical_ranges(actual.value_ranges())),
-            "(NULL)->(2000), (2001)->(3500)",
-            "should find proper ranges"
-        );
-
-        // Test: ASC, is overlapping
-        // (1000)->(2000), (2001)->(3500), and partition<(2001)->(3500)> has the NULL (min value)
-        let options = SortOptions {
-            descending: false,
-            nulls_first: true,
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_overlap_if_asc);
-        let actual = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?;
-        assert!(actual.is_none(), "should not find disjoint range");
-
-        // Test: DESC, is disjoint (not overlapping)
-        // (2001)->(3500), (1000)->(2000), and partition<(2001)->(3500)> has the NULL (max value)
-        let options = SortOptions {
-            descending: true,
-            nulls_first: true,
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_disjoint_if_desc);
-        let Some(actual) = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?
-        else {
-            unreachable!("should find disjoint")
-        };
-        assert_eq!(actual.indices(), &[1, 0], "should find proper ordering"); // NOTE THE INVERSE ORDER
-        assert_eq!(
-            format!("{}", str_lexical_ranges(actual.value_ranges())),
-            "(2001)->(NULL), (1000)->(2000)",
-            "should find proper ranges"
-        );
-
-        // Test: DESC, is overlapping
-        // (2001)->(3500), (1000)->(2000), and partition<(1000)->(2000)> has the NULL (max value)
-        let options = SortOptions {
-            descending: true,
-            nulls_first: true,
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_overlap_if_desc);
-        let actual = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?;
-        assert!(actual.is_none(), "should not find disjoint range");
-
-        Ok(())
-    }
-
-    /// Same as `test_extract_disjoint_ranges`, but include nulls last.
-    #[test]
-    fn test_extract_disjoint_ranges_nulls_last() -> Result<()> {
-        // NULL is max_value if ASC
-        let plan_ranges_disjoint_if_asc = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 1, // null is max value
-            },
-        ];
-        let plan_ranges_overlap_if_asc = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 1, // null is max value, this will be overlapping
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 0,
-            },
-        ];
-
-        // NULL is min_value if DESC
-        let plan_ranges_disjoint_if_desc = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 1, // null is min value
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 0,
-            },
-        ];
-        let plan_ranges_overlap_if_desc = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 1, // null is min value, this will be overlapping
-            },
-        ];
-
-        // Test: ASC, is disjoint (not overlapping)
-        // (1000)->(2000), (2001)->(3500), and partition<(2001)->(3500)> has the NULL (max value)
-        let options = SortOptions {
-            descending: false,
-            nulls_first: false,
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_disjoint_if_asc);
-        let Some(actual) = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?
-        else {
-            unreachable!("should find disjoint")
-        };
-        assert_eq!(actual.indices(), &[0, 1], "should find proper ordering");
-        assert_eq!(
-            format!("{}", str_lexical_ranges(actual.value_ranges())),
-            "(1000)->(2000), (2001)->(NULL)",
-            "should find proper ranges"
-        );
-
-        // Test: ASC, is overlapping
-        // (1000)->(2000), (2001)->(3500), and partition<(1000)->(2000)> has the NULL (max value)
-        let options = SortOptions {
-            descending: false,
-            nulls_first: false,
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_overlap_if_asc);
-        let actual = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?;
-        assert!(actual.is_none(), "should not find disjoint range");
-
-        // Test: DESC, is disjoint (not overlapping)
-        // (2001)->(3500), (1000)->(2000), and partition<(1000)->(2000)> has the NULL (min value)
-        let options = SortOptions {
-            descending: true,
-            nulls_first: false,
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_disjoint_if_desc);
-        let Some(actual) = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?
-        else {
-            unreachable!("should find disjoint")
-        };
-        assert_eq!(actual.indices(), &[1, 0], "should find proper ordering"); // NOTE THE INVERSE ORDER
-        assert_eq!(
-            format!("{}", str_lexical_ranges(actual.value_ranges())),
-            "(2001)->(3500), (NULL)->(2000)",
-            "should find proper ranges"
-        );
-
-        // Test: DESC, is overlapping
-        // (2001)->(3500), (1000)->(2000), and partition<(2001)->(3500)> has the NULL (min value)
-        let options = SortOptions {
-            descending: true,
-            nulls_first: false,
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case(&lex_ordering, plan_ranges_overlap_if_desc);
-        let actual = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?;
-        assert!(actual.is_none(), "should not find disjoint range");
-
-        Ok(())
-    }
-
-    /// Build a test physical plan like:
-    /// UNION
-    ///     ParquetExec (range_a)
-    ///     ParquetExec (range_b_1, range_b_2)
-    fn build_test_case_multiple_partition_parquet_exec(
-        ordering: &LexOrdering,
-        key_ranges: &[KeyRange; 3],
-    ) -> Arc<dyn ExecutionPlan> {
-        let [range_a, range_b_1, range_b_2] = key_ranges;
-
-        let datasrc_a =
-            parquet_exec_with_sort_with_statistics(vec![ordering.clone()], &[range_a]);
-        let datasrc_b = parquet_exec_with_sort_with_statistics(
-            vec![ordering.clone()],
-            &[range_b_1, range_b_2],
-        );
-
-        union_exec(vec![datasrc_a, datasrc_b])
-    }
-
-    #[test]
-    fn test_extract_multiple_partitions_union_parquet_exec() -> Result<()> {
-        let plan_ranges_disjoint = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 0,
-            },
-        ];
-        let plan_ranges_overlapping = &[
-            KeyRange {
-                min: Some(1000),
-                max: Some(2010),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(2001),
-                max: Some(3000),
-                null_count: 0,
-            },
-            KeyRange {
-                min: Some(3001),
-                max: Some(3500),
-                null_count: 0,
-            },
-        ];
-
-        // Test: ASC, is disjoint (not overlapping)
-        let options = SortOptions {
-            descending: false,
-            ..Default::default()
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case_multiple_partition_parquet_exec(
-            &lex_ordering,
-            plan_ranges_disjoint,
-        );
-        let Some(actual) = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?
-        else {
-            unreachable!("should find disjoint")
-        };
-        assert_eq!(actual.indices(), &[0, 1, 2], "should find proper ordering");
-        assert_eq!(
-            format!("{}", str_lexical_ranges(actual.value_ranges())),
-            "(1000)->(2000), (2001)->(3000), (3001)->(3500)",
-            "should find proper ranges"
-        );
-
-        // Test: ASC, is overlapping
-        let options = SortOptions {
-            descending: false,
-            ..Default::default()
-        };
-        let sort_expr = PhysicalSortExpr::new(col("a", &schema())?, options);
-        let lex_ordering = LexOrdering::new(vec![sort_expr]);
-        let plan = build_test_case_multiple_partition_parquet_exec(
-            &lex_ordering,
-            plan_ranges_overlapping,
-        );
-        let actual = extract_disjoint_ranges_from_plan(&lex_ordering, &plan)?;
-        assert!(actual.is_none(), "should not find disjoint range");
-
-        Ok(())
+            match self.actual.as_ref() {
+                Some(actual) => {
+                    writeln!(f, "Output Ranges: {:?}", actual.indices())?;
+                    for range in actual.ordered_ranges() {
+                        writeln!(f, "  {}", range)?;
+                    }
+                }
+                None => {
+                    writeln!(f, "No disjoint ranges found")?;
+                }
+            }
+            Ok(())
+        }
     }
 }

@@ -591,7 +591,7 @@ impl EmbeddedProjection for FilterExec {
 /// converted to closed bounds. If a lower/upper bound is initially open, it
 /// is adjusted by using the next/previous value for its data type to convert
 /// it into a closed bound.
-fn collect_new_statistics(
+pub fn collect_new_statistics(
     input_column_stats: &[ColumnStatistics],
     analysis_boundaries: Vec<ExprBoundaries>,
 ) -> Vec<ColumnStatistics> {

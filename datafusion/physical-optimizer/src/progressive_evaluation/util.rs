@@ -165,7 +165,264 @@ fn transform_parquet_exec_single_file_each_group(
 fn build_file_group_with_stats(file: &PartitionedFile) -> FileGroup {
     let mut group = FileGroup::new(vec![file.clone()]);
     if let Some(stats) = &file.statistics {
-        group = group.with_statistics(Arc::unwrap_or_clone(stats.to_owned()))
+        group = group.with_statistics(Arc::clone(stats))
     }
     group
+}
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use arrow::datatypes::DataType;
+    use arrow::datatypes::Field;
+    use arrow::datatypes::SchemaRef;
+    use datafusion_common::ScalarValue;
+    use datafusion_common::{stats::Precision, Statistics};
+    use datafusion_datasource::file_scan_config::FileScanConfig;
+    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+    use datafusion_datasource::source::DataSourceExec;
+    use datafusion_datasource::PartitionedFile;
+    use datafusion_datasource_parquet::source::ParquetSource;
+    use datafusion_execution::object_store::ObjectStoreUrl;
+    use datafusion_physical_expr::LexOrdering;
+    use datafusion_physical_plan::{
+        coalesce_batches::CoalesceBatchesExec,
+        filter::FilterExec,
+        joins::CrossJoinExec,
+        limit::LocalLimitExec,
+        projection::ProjectionExec,
+        repartition::RepartitionExec,
+        sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
+        union::UnionExec,
+        Partitioning, PhysicalExpr,
+    };
+    use datafusion_physical_plan::{ColumnStatistics, ExecutionPlan};
+
+    use itertools::Itertools;
+
+    use std::{
+        fmt::{self, Display, Formatter},
+        sync::Arc,
+    };
+
+    /// Return a schema with a single column `a` of type int64.
+    pub fn single_column_schema() -> SchemaRef {
+        Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "a",
+            DataType::Int64,
+            true,
+        )]))
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    pub struct SortKeyRange {
+        pub min: Option<i32>,
+        pub max: Option<i32>,
+        pub null_count: usize,
+    }
+
+    impl From<SortKeyRange> for ColumnStatistics {
+        fn from(val: SortKeyRange) -> Self {
+            Self {
+                null_count: Precision::Exact(val.null_count),
+                max_value: Precision::Exact(ScalarValue::Int32(val.max)),
+                min_value: Precision::Exact(ScalarValue::Int32(val.min)),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+            }
+        }
+    }
+
+    impl Display for SortKeyRange {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "({:?})->({:?})", self.min, self.max)?;
+            if self.null_count > 0 {
+                write!(f, " null_count={}", self.null_count)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Create a single parquet, with a given ordering and using the statistics from the [`SortKeyRange`]
+    pub fn parquet_exec_with_sort_with_statistics(
+        output_ordering: Vec<LexOrdering>,
+        key_ranges: &[&SortKeyRange],
+    ) -> Arc<dyn ExecutionPlan> {
+        parquet_exec_with_sort_with_statistics_and_schema(
+            &single_column_schema(),
+            output_ordering,
+            key_ranges,
+        )
+    }
+
+    pub type RangeForMultipleColumns = Vec<SortKeyRange>; // vec![col0, col1, col2]
+    pub struct PartitionedFilesAndRanges {
+        pub per_file: Vec<RangeForMultipleColumns>,
+    }
+
+    /// Create a single parquet exec, with multiple parquet, with a given ordering and using the statistics from the [`SortKeyRange`].
+    /// Assumes a single column schema.
+    pub fn parquet_exec_with_sort_with_statistics_and_schema(
+        schema: &SchemaRef,
+        output_ordering: Vec<LexOrdering>,
+        key_ranges_for_single_column_multiple_files: &[&SortKeyRange], // VecPerFile<KeyForSingleColumn>
+    ) -> Arc<dyn ExecutionPlan> {
+        let per_file_ranges = PartitionedFilesAndRanges {
+            per_file: key_ranges_for_single_column_multiple_files
+                .iter()
+                .map(|single_col_range_per_file| vec![**single_col_range_per_file])
+                .collect_vec(),
+        };
+
+        let file_scan_config = file_scan_config(schema, output_ordering, per_file_ranges);
+
+        DataSourceExec::from_data_source(file_scan_config)
+    }
+
+    /// Create a file scan config with a given file [`SchemaRef`], ordering,
+    /// and [`ColumnStatistics`] for multiple columns.
+    pub fn file_scan_config(
+        schema: &SchemaRef,
+        output_ordering: Vec<LexOrdering>,
+        multiple_column_key_ranges_per_file: PartitionedFilesAndRanges,
+    ) -> FileScanConfig {
+        let PartitionedFilesAndRanges { per_file } = multiple_column_key_ranges_per_file;
+        let mut statistics = Statistics::new_unknown(schema);
+        let mut file_groups = Vec::with_capacity(per_file.len());
+
+        // cummulative statistics for the entire parquet exec, per sort key
+        let num_sort_keys = per_file[0].len();
+        let mut cum_null_count = vec![0; num_sort_keys];
+        let mut cum_min = vec![None; num_sort_keys];
+        let mut cum_max = vec![None; num_sort_keys];
+
+        // iterate thru files, creating the PartitionedFile and the associated statistics
+        for (file_idx, multiple_column_key_ranges_per_file) in
+            per_file.into_iter().enumerate()
+        {
+            // gather stats for all columns
+            let mut per_file_col_stats = Vec::with_capacity(num_sort_keys);
+            for (col_idx, key_range) in
+                multiple_column_key_ranges_per_file.into_iter().enumerate()
+            {
+                let SortKeyRange {
+                    min,
+                    max,
+                    null_count,
+                } = key_range;
+
+                // update per file stats
+                per_file_col_stats.push(ColumnStatistics {
+                    null_count: Precision::Exact(null_count),
+                    min_value: Precision::Exact(ScalarValue::Int32(min)),
+                    max_value: Precision::Exact(ScalarValue::Int32(max)),
+                    ..Default::default()
+                });
+
+                // update cummulative statistics for entire parquet exec
+                cum_min[col_idx] = match (cum_min[col_idx], min) {
+                    (None, x) => x,
+                    (x, None) => x,
+                    (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+                };
+                cum_max[col_idx] = match (cum_max[col_idx], max) {
+                    (None, x) => x,
+                    (x, None) => x,
+                    (Some(a), Some(b)) => Some(std::cmp::max(a, b)),
+                };
+                cum_null_count[col_idx] += null_count;
+            }
+
+            // Create single file with statistics.
+            let mut file = PartitionedFile::new(format!("{file_idx}.parquet"), 100);
+            file.statistics = Some(Arc::new(Statistics {
+                num_rows: Precision::Absent,
+                total_byte_size: Precision::Absent,
+                column_statistics: per_file_col_stats,
+            }));
+            file_groups.push(vec![file].into());
+        }
+
+        // add stats, for the whole parquet exec, for all columns
+        for col_idx in 0..num_sort_keys {
+            statistics.column_statistics[col_idx] = ColumnStatistics {
+                null_count: Precision::Exact(cum_null_count[col_idx]),
+                min_value: Precision::Exact(ScalarValue::Int32(cum_min[col_idx])),
+                max_value: Precision::Exact(ScalarValue::Int32(cum_max[col_idx])),
+                ..Default::default()
+            };
+        }
+
+        FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::clone(schema),
+            Arc::new(ParquetSource::new(Default::default())),
+        )
+        .with_file_groups(file_groups)
+        .with_output_ordering(output_ordering)
+        .with_statistics(statistics)
+        .build()
+    }
+
+    pub fn union_exec(input: Vec<Arc<dyn ExecutionPlan>>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(UnionExec::new(input))
+    }
+
+    pub fn sort_exec(
+        sort_exprs: &LexOrdering,
+        input: &Arc<dyn ExecutionPlan>,
+        preserve_partitioning: bool,
+    ) -> Arc<dyn ExecutionPlan> {
+        let new_sort = SortExec::new(sort_exprs.clone(), Arc::clone(input))
+            .with_preserve_partitioning(preserve_partitioning);
+        Arc::new(new_sort)
+    }
+
+    pub fn coalesce_exec(input: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(CoalesceBatchesExec::new(Arc::clone(input), 10))
+    }
+
+    pub fn filter_exec(
+        input: &Arc<dyn ExecutionPlan>,
+        predicate: Arc<dyn PhysicalExpr>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(FilterExec::try_new(predicate, Arc::clone(input)).unwrap())
+    }
+
+    pub fn limit_exec(
+        input: &Arc<dyn ExecutionPlan>,
+        fetch: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(LocalLimitExec::new(Arc::clone(input), fetch))
+    }
+
+    pub fn proj_exec(
+        input: &Arc<dyn ExecutionPlan>,
+        projects: Vec<(Arc<dyn PhysicalExpr>, String)>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(ProjectionExec::try_new(projects, Arc::clone(input)).unwrap())
+    }
+
+    pub fn spm_exec(
+        input: &Arc<dyn ExecutionPlan>,
+        sort_exprs: &LexOrdering,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(SortPreservingMergeExec::new(
+            sort_exprs.clone(),
+            Arc::clone(input),
+        ))
+    }
+
+    pub fn repartition_exec(
+        input: &Arc<dyn ExecutionPlan>,
+        partitioning: Partitioning,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(RepartitionExec::try_new(Arc::clone(input), partitioning).unwrap())
+    }
+
+    pub fn crossjoin_exec(
+        left: &Arc<dyn ExecutionPlan>,
+        right: &Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(CrossJoinExec::new(Arc::clone(left), Arc::clone(right)))
+    }
 }
