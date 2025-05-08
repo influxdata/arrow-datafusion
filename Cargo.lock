@@ -2447,6 +2447,8 @@ version = "47.0.0"
 dependencies = [
  "arrow",
  "datafusion-common",
+ "datafusion-datasource",
+ "datafusion-datasource-parquet",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-expr-common",
