@@ -2179,7 +2179,7 @@ mod tests {
 
         // create table
         let tmp_dir = TempDir::new()?;
-        let tmp_path = tmp_dir.into_path();
+        let tmp_path = tmp_dir.keep();
         let str_path = tmp_path.to_str().expect("Temp path should convert to &str");
         session_ctx
             .sql(&format!(
