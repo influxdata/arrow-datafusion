@@ -2148,17 +2148,38 @@ fn calculate_union_binary(
         })
         .collect::<Vec<_>>();
 
+    // TEMP HACK WORKAROUND
+    // Revert code from https://github.com/apache/datafusion/pull/12562
+    // Context: https://github.com/apache/datafusion/issues/13748
+    // Context: https://github.com/influxdata/influxdb_iox/issues/13038
+
     // Next, calculate valid orderings for the union by searching for prefixes
     // in both sides.
-    let mut orderings = UnionEquivalentOrderingBuilder::new();
-    orderings.add_satisfied_orderings(lhs.normalized_oeq_class(), lhs.constants(), &rhs);
-    orderings.add_satisfied_orderings(rhs.normalized_oeq_class(), rhs.constants(), &lhs);
-    let orderings = orderings.build();
-
-    let mut eq_properties =
-        EquivalenceProperties::new(lhs.schema).with_constants(constants);
-
+    let mut orderings = vec![];
+    for mut ordering in lhs.normalized_oeq_class().into_iter() {
+        // Progressively shorten the ordering to search for a satisfied prefix:
+        while !rhs.ordering_satisfy(&ordering) {
+            ordering.pop();
+        }
+        // There is a non-trivial satisfied prefix, add it as a valid ordering:
+        if !ordering.is_empty() {
+            orderings.push(ordering);
+        }
+    }
+    for mut ordering in rhs.normalized_oeq_class().into_iter() {
+        // Progressively shorten the ordering to search for a satisfied prefix:
+        while !lhs.ordering_satisfy(&ordering) {
+            ordering.pop();
+        }
+        // There is a non-trivial satisfied prefix, add it as a valid ordering:
+        if !ordering.is_empty() {
+            orderings.push(ordering);
+        }
+    }
+    let mut eq_properties = EquivalenceProperties::new(lhs.schema);
+    eq_properties.constants = constants;
     eq_properties.add_new_orderings(orderings);
+
     Ok(eq_properties)
 }
 
@@ -2204,6 +2225,7 @@ struct UnionEquivalentOrderingBuilder {
     orderings: Vec<LexOrdering>,
 }
 
+#[expect(unused)]
 impl UnionEquivalentOrderingBuilder {
     fn new() -> Self {
         Self { orderings: vec![] }
@@ -3553,134 +3575,6 @@ mod tests {
     }
 
     #[test]
-    fn test_union_equivalence_properties_constants_fill_gaps() {
-        let schema = create_test_schema().unwrap();
-        UnionEquivalenceTest::new(&schema)
-            .with_child_sort_and_const_exprs(
-                // First child orderings: [a ASC, c ASC], const [b]
-                vec![vec!["a", "c"]],
-                vec!["b"],
-                &schema,
-            )
-            .with_child_sort_and_const_exprs(
-                // Second child orderings: [b ASC, c ASC], const [a]
-                vec![vec!["b", "c"]],
-                vec!["a"],
-                &schema,
-            )
-            .with_expected_sort_and_const_exprs(
-                // Union orderings: [
-                //   [a ASC, b ASC, c ASC],
-                //   [b ASC, a ASC, c ASC]
-                // ], const []
-                vec![vec!["a", "b", "c"], vec!["b", "a", "c"]],
-                vec![],
-            )
-            .run()
-    }
-
-    #[test]
-    fn test_union_equivalence_properties_constants_no_fill_gaps() {
-        let schema = create_test_schema().unwrap();
-        UnionEquivalenceTest::new(&schema)
-            .with_child_sort_and_const_exprs(
-                // First child orderings: [a ASC, c ASC], const [d] // some other constant
-                vec![vec!["a", "c"]],
-                vec!["d"],
-                &schema,
-            )
-            .with_child_sort_and_const_exprs(
-                // Second child orderings: [b ASC, c ASC], const [a]
-                vec![vec!["b", "c"]],
-                vec!["a"],
-                &schema,
-            )
-            .with_expected_sort_and_const_exprs(
-                // Union orderings: [[a]] (only a is constant)
-                vec![vec!["a"]],
-                vec![],
-            )
-            .run()
-    }
-
-    #[test]
-    fn test_union_equivalence_properties_constants_fill_some_gaps() {
-        let schema = create_test_schema().unwrap();
-        UnionEquivalenceTest::new(&schema)
-            .with_child_sort_and_const_exprs(
-                // First child orderings: [c ASC], const [a, b] // some other constant
-                vec![vec!["c"]],
-                vec!["a", "b"],
-                &schema,
-            )
-            .with_child_sort_and_const_exprs(
-                // Second child orderings: [a DESC, b], const []
-                vec![vec!["a DESC", "b"]],
-                vec![],
-                &schema,
-            )
-            .with_expected_sort_and_const_exprs(
-                // Union orderings: [[a, b]] (can fill in the a/b with constants)
-                vec![vec!["a DESC", "b"]],
-                vec![],
-            )
-            .run()
-    }
-
-    #[test]
-    fn test_union_equivalence_properties_constants_fill_gaps_non_symmetric() {
-        let schema = create_test_schema().unwrap();
-        UnionEquivalenceTest::new(&schema)
-            .with_child_sort_and_const_exprs(
-                // First child orderings: [a ASC, c ASC], const [b]
-                vec![vec!["a", "c"]],
-                vec!["b"],
-                &schema,
-            )
-            .with_child_sort_and_const_exprs(
-                // Second child orderings: [b ASC, c ASC], const [a]
-                vec![vec!["b DESC", "c"]],
-                vec!["a"],
-                &schema,
-            )
-            .with_expected_sort_and_const_exprs(
-                // Union orderings: [
-                //   [a ASC, b ASC, c ASC],
-                //   [b ASC, a ASC, c ASC]
-                // ], const []
-                vec![vec!["a", "b DESC", "c"], vec!["b DESC", "a", "c"]],
-                vec![],
-            )
-            .run()
-    }
-
-    #[test]
-    fn test_union_equivalence_properties_constants_gap_fill_symmetric() {
-        let schema = create_test_schema().unwrap();
-        UnionEquivalenceTest::new(&schema)
-            .with_child_sort_and_const_exprs(
-                // First child: [a ASC, b ASC, d ASC], const [c]
-                vec![vec!["a", "b", "d"]],
-                vec!["c"],
-                &schema,
-            )
-            .with_child_sort_and_const_exprs(
-                // Second child: [a ASC, c ASC, d ASC], const [b]
-                vec![vec!["a", "c", "d"]],
-                vec!["b"],
-                &schema,
-            )
-            .with_expected_sort_and_const_exprs(
-                // Union orderings:
-                // [a, b, c, d]
-                // [a, c, b, d]
-                vec![vec!["a", "c", "b", "d"], vec!["a", "b", "c", "d"]],
-                vec![],
-            )
-            .run()
-    }
-
-    #[test]
     fn test_union_equivalence_properties_constants_gap_fill_and_common() {
         let schema = create_test_schema().unwrap();
         UnionEquivalenceTest::new(&schema)
@@ -3701,34 +3595,6 @@ mod tests {
                 // [a DESC, c, d]  [b]
                 vec![vec!["a DESC", "c", "d"]],
                 vec!["b"],
-            )
-            .run()
-    }
-
-    #[test]
-    fn test_union_equivalence_properties_constants_middle_desc() {
-        let schema = create_test_schema().unwrap();
-        UnionEquivalenceTest::new(&schema)
-            .with_child_sort_and_const_exprs(
-                // NB `b DESC` in the first child
-                //
-                // First child: [a ASC, b DESC, d ASC], const [c]
-                vec![vec!["a", "b DESC", "d"]],
-                vec!["c"],
-                &schema,
-            )
-            .with_child_sort_and_const_exprs(
-                // Second child: [a ASC, c ASC, d ASC], const [b]
-                vec![vec!["a", "c", "d"]],
-                vec!["b"],
-                &schema,
-            )
-            .with_expected_sort_and_const_exprs(
-                // Union orderings:
-                // [a, b, d] (c constant)
-                // [a, c, d] (b constant)
-                vec![vec!["a", "c", "b DESC", "d"], vec!["a", "b DESC", "c", "d"]],
-                vec![],
             )
             .run()
     }
