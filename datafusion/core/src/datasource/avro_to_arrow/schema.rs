@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::arrow::datatypes::{DataType, IntervalUnit, Schema, TimeUnit, UnionMode};
-use crate::error::{DataFusionError, Result};
+use crate::error::Result;
 use apache_avro::schema::{
     Alias, DecimalSchema, EnumSchema, FixedSchema, Name, RecordSchema,
 };
@@ -107,9 +107,7 @@ fn schema_to_field_with_props(
                         .data_type()
                         .clone()
                 } else {
-                    return Err(DataFusionError::AvroError(
-                        apache_avro::Error::GetUnionDuplicate,
-                    ));
+                    return Err(apache_avro::Error::GetUnionDuplicate.into());
                 }
             } else {
                 let fields = sub_schemas
