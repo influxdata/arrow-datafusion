@@ -325,8 +325,10 @@ impl std::fmt::Display for ListingTableUrl {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const GLOB_START_CHARS: [char; 3] = ['?', '*', '['];
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Splits `path` at the first path segment containing a glob expression, returning
 /// `None` if no glob expression found.
 ///

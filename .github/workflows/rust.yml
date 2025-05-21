@@ -290,7 +290,7 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Build with wasm-pack
         working-directory: ./datafusion/wasmtest
-        run: wasm-pack build --dev
+        run: RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --dev
 
   # verify that the benchmark queries return the correct results
   verify-benchmark-results:

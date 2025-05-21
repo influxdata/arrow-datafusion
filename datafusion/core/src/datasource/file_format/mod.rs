@@ -424,6 +424,7 @@ pub fn transform_schema_to_view(schema: &Schema) -> Schema {
     Schema::new_with_metadata(transformed_fields, schema.metadata.clone())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Coerces the file schema if the table schema uses a view type.
 pub(crate) fn coerce_file_schema_to_view_type(
     table_schema: &Schema,
@@ -486,6 +487,7 @@ pub fn transform_binary_to_string(schema: &Schema) -> Schema {
     Schema::new_with_metadata(transformed_fields, schema.metadata.clone())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// If the table schema uses a string type, coerce the file schema to use a string type.
 ///
 /// See [parquet::ParquetFormat::binary_as_string] for details
