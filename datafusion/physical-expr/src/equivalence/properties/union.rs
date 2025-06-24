@@ -67,16 +67,43 @@ fn calculate_union_binary(
         })
         .collect::<Vec<_>>();
 
+    // TEMP HACK WORKAROUND
+    // Revert code from https://github.com/apache/datafusion/pull/12562
+    // Context: https://github.com/apache/datafusion/issues/13748
+    // Context: https://github.com/influxdata/influxdb_iox/issues/13038
+
     // Next, calculate valid orderings for the union by searching for prefixes
     // in both sides.
-    let mut orderings = UnionEquivalentOrderingBuilder::new();
-    orderings.add_satisfied_orderings(&lhs, &rhs)?;
-    orderings.add_satisfied_orderings(&rhs, &lhs)?;
-    let orderings = orderings.build();
+    let mut orderings = vec![];
+    for ordering in lhs.normalized_oeq_class().into_iter() {
+        let mut ordering: Vec<PhysicalSortExpr> = ordering.into();
 
+        // Progressively shorten the ordering to search for a satisfied prefix:
+        while !rhs.ordering_satisfy(ordering.clone())? {
+            ordering.pop();
+        }
+        // There is a non-trivial satisfied prefix, add it as a valid ordering:
+        if !ordering.is_empty() {
+            orderings.push(ordering);
+        }
+    }
+
+    for ordering in rhs.normalized_oeq_class().into_iter() {
+        let mut ordering: Vec<PhysicalSortExpr> = ordering.into();
+
+        // Progressively shorten the ordering to search for a satisfied prefix:
+        while !lhs.ordering_satisfy(ordering.clone())? {
+            ordering.pop();
+        }
+        // There is a non-trivial satisfied prefix, add it as a valid ordering:
+        if !ordering.is_empty() {
+            orderings.push(ordering);
+        }
+    }
     let mut eq_properties = EquivalenceProperties::new(lhs.schema);
     eq_properties.add_constants(constants)?;
     eq_properties.add_orderings(orderings);
+
     Ok(eq_properties)
 }
 
@@ -122,6 +149,7 @@ struct UnionEquivalentOrderingBuilder {
     orderings: Vec<LexOrdering>,
 }
 
+#[expect(unused)]
 impl UnionEquivalentOrderingBuilder {
     fn new() -> Self {
         Self { orderings: vec![] }
@@ -504,6 +532,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "InfluxData patch: chore: skip order calculation / exponential planning"]
     fn test_union_equivalence_properties_constants_fill_gaps() -> Result<()> {
         let schema = create_test_schema().unwrap();
         UnionEquivalenceTest::new(&schema)
@@ -579,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "InfluxData patch: chore: skip order calculation / exponential planning"]
     fn test_union_equivalence_properties_constants_fill_gaps_non_symmetric() -> Result<()>
     {
         let schema = create_test_schema().unwrap();
@@ -607,6 +637,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "InfluxData patch: chore: skip order calculation / exponential planning"]
     fn test_union_equivalence_properties_constants_gap_fill_symmetric() -> Result<()> {
         let schema = create_test_schema().unwrap();
         UnionEquivalenceTest::new(&schema)
@@ -658,6 +689,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "InfluxData patch: chore: skip order calculation / exponential planning"]
     fn test_union_equivalence_properties_constants_middle_desc() -> Result<()> {
         let schema = create_test_schema().unwrap();
         UnionEquivalenceTest::new(&schema)
