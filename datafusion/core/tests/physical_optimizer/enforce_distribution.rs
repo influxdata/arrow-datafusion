@@ -19,11 +19,11 @@ use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::physical_optimizer::test_utils::parquet_exec_with_sort;
 use crate::physical_optimizer::test_utils::{
     check_integrity, coalesce_partitions_exec, repartition_exec, schema,
     sort_merge_join_exec, sort_preserving_merge_exec,
 };
+use crate::physical_optimizer::test_utils::{parquet_exec_with_sort, trim_plan_display};
 
 use arrow::compute::SortOptions;
 use datafusion::config::ConfigOptions;
@@ -33,11 +33,14 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::{CsvSource, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion_common::error::Result;
+use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::ScalarValue;
+use datafusion_common::{assert_contains, ColumnStatistics, ScalarValue};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-use datafusion_expr::{JoinType, Operator};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_expr::{AggregateUDF, JoinType, Operator};
+use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::{
@@ -47,6 +50,7 @@ use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use datafusion_physical_optimizer::enforce_distribution::*;
 use datafusion_physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion_physical_optimizer::output_requirements::OutputRequirements;
+use datafusion_physical_optimizer::sanity_checker::check_plan_sanity;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
@@ -61,8 +65,8 @@ use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::PlanProperties;
+use datafusion_physical_plan::{displayable, ExecutionPlanProperties};
 use datafusion_physical_plan::{
     get_plan_string, DisplayAs, DisplayFormatType, Statistics,
 };
@@ -163,8 +167,8 @@ impl ExecutionPlan for SortRequiredExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<datafusion::execution::context::TaskContext>,
-    ) -> Result<datafusion_physical_plan::SendableRecordBatchStream> {
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
         unreachable!();
     }
 
@@ -175,6 +179,47 @@ impl ExecutionPlan for SortRequiredExec {
 
 fn parquet_exec() -> Arc<DataSourceExec> {
     parquet_exec_with_sort(vec![])
+}
+
+fn int64_stats() -> ColumnStatistics {
+    ColumnStatistics {
+        null_count: Precision::Absent,
+        max_value: Precision::Exact(1_000_000.into()),
+        min_value: Precision::Exact(0.into()),
+        distinct_count: Precision::Absent,
+        sum_value: Precision::Absent,
+    }
+}
+
+fn column_stats() -> Vec<ColumnStatistics> {
+    vec![
+        int64_stats(), // a
+        int64_stats(), // b
+        int64_stats(), // c
+        ColumnStatistics::default(),
+        ColumnStatistics::default(),
+    ]
+}
+
+pub(crate) fn parquet_exec_with_stats() -> Arc<DataSourceExec> {
+    let mut statistics = Statistics::new_unknown(&schema());
+    statistics.num_rows = Precision::Inexact(10);
+    statistics.column_statistics = column_stats();
+
+    let config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::parse("test:///").unwrap(),
+        schema(),
+        Arc::new(ParquetSource::default()),
+    )
+    .with_file(PartitionedFile::new("x".to_string(), 10000))
+    .with_statistics(statistics)
+    .build();
+    assert_eq!(
+        config.file_source().statistics().unwrap().num_rows,
+        Precision::Inexact(10)
+    );
+
+    DataSourceExec::from_data_source(config)
 }
 
 fn parquet_exec_multiple() -> Arc<DataSourceExec> {
@@ -238,7 +283,7 @@ fn csv_exec_multiple_sorted(output_ordering: Vec<LexOrdering>) -> Arc<DataSource
     DataSourceExec::from_data_source(config)
 }
 
-fn projection_exec_with_alias(
+pub(crate) fn projection_exec_with_alias(
     input: Arc<dyn ExecutionPlan>,
     alias_pairs: Vec<(String, String)>,
 ) -> Arc<dyn ExecutionPlan> {
@@ -251,6 +296,15 @@ fn projection_exec_with_alias(
 
 fn aggregate_exec_with_alias(
     input: Arc<dyn ExecutionPlan>,
+    alias_pairs: Vec<(String, String)>,
+) -> Arc<dyn ExecutionPlan> {
+    aggregate_exec_with_aggr_expr_and_alias(input, vec![], alias_pairs)
+}
+
+#[expect(clippy::type_complexity)]
+fn aggregate_exec_with_aggr_expr_and_alias(
+    input: Arc<dyn ExecutionPlan>,
+    aggr_expr: Vec<(Arc<AggregateUDF>, Vec<Arc<dyn PhysicalExpr>>)>,
     alias_pairs: Vec<(String, String)>,
 ) -> Arc<dyn ExecutionPlan> {
     let schema = schema();
@@ -272,18 +326,31 @@ fn aggregate_exec_with_alias(
         .collect::<Vec<_>>();
     let final_grouping = PhysicalGroupBy::new_single(final_group_by_expr);
 
+    let aggr_expr = aggr_expr
+        .into_iter()
+        .map(|(udaf, exprs)| {
+            AggregateExprBuilder::new(udaf.clone(), exprs)
+                .alias(udaf.name())
+                .schema(Arc::clone(&schema))
+                .build()
+                .map(Arc::new)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let filter_exprs = std::iter::repeat_n(None, aggr_expr.len()).collect::<Vec<_>>();
+
     Arc::new(
         AggregateExec::try_new(
             AggregateMode::FinalPartitioned,
             final_grouping,
-            vec![],
-            vec![],
+            aggr_expr.clone(),
+            filter_exprs.clone(),
             Arc::new(
                 AggregateExec::try_new(
                     AggregateMode::Partial,
                     group_by,
-                    vec![],
-                    vec![],
+                    aggr_expr,
+                    filter_exprs,
                     input,
                     schema.clone(),
                 )
@@ -454,6 +521,12 @@ impl TestConfig {
         self
     }
 
+    /// Set batch size.
+    fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.config.execution.batch_size = batch_size;
+        self
+    }
+
     /// Perform a series of runs using the current [`TestConfig`],
     /// assert the expected plan result,
     /// and return the result plan (for potentional subsequent runs).
@@ -531,6 +604,22 @@ impl TestConfig {
         Ok(optimized)
     }
 }
+
+// macro_rules! assert_optimized_without_forced_roundrobin {
+//     ($EXPECTED_LINES: expr, $PLAN: expr, $FIRST_ENFORCE_DIST: expr) => {
+//         assert_optimized!(
+//             $EXPECTED_LINES,
+//             $PLAN,
+//             $FIRST_ENFORCE_DIST,
+//             false, // prefer existing sort = default
+//             10,    // target partitions = default
+//             false, // repartition file scans = default
+//             1024,  // REPARTITION_FILE_MIN_SIZE = default
+//             false, // PREFER_EXISTING_UNION = default
+//             100    // batch size
+//         );
+//     };
+// }
 
 macro_rules! assert_plan_txt {
     ($EXPECTED_LINES: expr, $PLAN: expr) => {
@@ -2035,6 +2124,282 @@ fn repartition_ignores_union() -> Result<()> {
     let test_config = TestConfig::default();
     test_config.run(expected, plan.clone(), &DISTRIB_DISTRIB_SORT)?;
     test_config.run(expected, plan, &SORT_DISTRIB_DISTRIB)?;
+
+    Ok(())
+}
+
+fn aggregate_over_union(input: Vec<Arc<dyn ExecutionPlan>>) -> Arc<dyn ExecutionPlan> {
+    let union = union_exec(input);
+    let plan =
+        aggregate_exec_with_alias(union, vec![("a".to_string(), "a1".to_string())]);
+
+    // Demonstrate starting plan.
+    let before = displayable(plan.as_ref()).indent(true).to_string();
+    let before = trim_plan_display(&before);
+    assert_eq!(
+        before,
+        vec![
+            "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[]",
+            "AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[]",
+            "UnionExec",
+            "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+            "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        ],
+    );
+
+    plan
+}
+
+// Aggregate over a union,
+// with current testing setup.
+//
+// It will repartiton twice for an aggregate over a union.
+// * repartitions before the partial aggregate.
+// * repartitions before the final aggregation.
+#[test]
+fn repartitions_twice_for_aggregate_after_union() -> Result<()> {
+    let plan = aggregate_over_union(vec![parquet_exec(); 2]);
+
+    // We get a distribution error without repartitioning.
+    let err = check_plan_sanity(plan.clone(), &Default::default()).unwrap_err();
+    assert_contains!(
+        err.message(),
+        "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet\"] does not satisfy distribution requirements: HashPartitioned[[a1@0]]). Child-0 output partitioning: UnknownPartitioning(2)"
+    );
+
+    // Updated plan (post optimization) will have added RepartitionExecs (btwn union and aggregation).
+    let expected = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[]",
+        "  RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "    AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[]",
+        "      RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
+        "        UnionExec",
+        "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    let test_config = TestConfig::default();
+    test_config.run(expected, plan.clone(), &DISTRIB_DISTRIB_SORT)?;
+    test_config.run(expected, plan, &SORT_DISTRIB_DISTRIB)?;
+
+    Ok(())
+}
+
+// Aggregate over a union,
+// but make the test setup more realistic.
+//
+// It will repartiton once for an aggregate over a union.
+// * repartitions btwn partial & final aggregations.
+#[test]
+fn repartitions_once_for_aggregate_after_union() -> Result<()> {
+    // use parquet exec with stats
+    let plan: Arc<dyn ExecutionPlan> =
+        aggregate_over_union(vec![parquet_exec_with_stats(); 2]);
+
+    // We get a distribution error without repartitioning.
+    let err = check_plan_sanity(plan.clone(), &Default::default()).unwrap_err();
+    assert_contains!(
+        err.message(),
+        "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet\"] does not satisfy distribution requirements: HashPartitioned[[a1@0]]). Child-0 output partitioning: UnknownPartitioning(2)"
+    );
+
+    // This removes the forced round-robin repartitioning,
+    // by no longer hard-coding batch_size=1.
+    //
+    // Updated plan (post optimization) will have added only 1 RepartitionExec.
+    let expected = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[]",
+        "  RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "    AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[]",
+        "      RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
+        "        UnionExec",
+        "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    let test_config = TestConfig::default().with_batch_size(100);
+    test_config.run(expected, plan.clone(), &DISTRIB_DISTRIB_SORT)?;
+    test_config.run(expected, plan, &SORT_DISTRIB_DISTRIB)?;
+
+    Ok(())
+}
+
+/// Same as [`aggregate_over_union`], but with a sort btwn the union and aggregation.
+fn aggregate_over_sorted_union(
+    input: Vec<Arc<dyn ExecutionPlan>>,
+) -> Arc<dyn ExecutionPlan> {
+    let union = union_exec(input);
+    let schema = schema();
+    let sort_key = LexOrdering::new(vec![PhysicalSortExpr {
+        expr: col("a", &schema).unwrap(),
+        options: SortOptions::default(),
+    }]);
+    let sort = sort_exec(sort_key, union, false);
+    let plan = aggregate_exec_with_alias(sort, vec![("a".to_string(), "a1".to_string())]);
+
+    // Demonstrate starting plan.
+    // Notice the `ordering_mode=Sorted` on the aggregations.
+    let before = displayable(plan.as_ref()).indent(true).to_string();
+    let before = trim_plan_display(&before);
+    assert_eq!(
+        before,
+        vec![
+            "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+            "AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+            "SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+            "UnionExec",
+            "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+            "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        ],
+    );
+
+    plan
+}
+
+/// Same as [`repartitions_once_for_aggregate_after_union`], but adds a sort btwn
+/// the union and the aggregate. This changes the outcome:
+///
+/// * we no longer get a distribution error.
+/// * but we still get repartitioning?
+#[test]
+fn repartitions_for_aggregate_after_sorted_union() -> Result<()> {
+    let plan = aggregate_over_sorted_union(vec![parquet_exec_with_stats(); 2]);
+
+    // With the sort, there is no distribution error.
+    let checker = check_plan_sanity(plan.clone(), &Default::default());
+    assert!(checker.is_ok());
+
+    // It does not repartition on the first run
+    let expected_after_first_run = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+        "  SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "    RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "      AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+        "        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1",
+        "          SortPreservingMergeExec: [a@0 ASC]",
+        "            UnionExec",
+        "              SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+        "                DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "              SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+        "                DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    let test_config = TestConfig::default().with_batch_size(100);
+    test_config.run(
+        expected_after_first_run,
+        plan.clone(),
+        &DISTRIB_DISTRIB_SORT,
+    )?;
+
+    // But does repartition on the second run.
+    let expected_after_second_run = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+        "  SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "    RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "      SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "        AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+        "          SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "            RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
+        "              SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "                UnionExec",
+        "                  SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+        "                    DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "                  SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+        "                    DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    test_config.run(expected_after_second_run, plan, &SORT_DISTRIB_DISTRIB)?;
+
+    Ok(())
+}
+
+/// Same as [`aggregate_over_sorted_union`], but with a sort btwn the union and aggregation.
+fn aggregate_over_sorted_union_projection(
+    input: Vec<Arc<dyn ExecutionPlan>>,
+) -> Arc<dyn ExecutionPlan> {
+    let union = union_exec(input);
+    let union_projection = projection_exec_with_alias(
+        union,
+        vec![
+            ("a".to_string(), "a".to_string()),
+            ("b".to_string(), "value".to_string()),
+        ],
+    );
+    let schema = schema();
+    let sort_key = LexOrdering::new(vec![PhysicalSortExpr {
+        expr: col("a", &schema).unwrap(),
+        options: SortOptions::default(),
+    }]);
+    let sort = sort_exec(sort_key, union_projection, false);
+    let plan = aggregate_exec_with_alias(sort, vec![("a".to_string(), "a1".to_string())]);
+
+    // Demonstrate starting plan.
+    // Notice the `ordering_mode=Sorted` on the aggregations.
+    let before = displayable(plan.as_ref()).indent(true).to_string();
+    let before = trim_plan_display(&before);
+    assert_eq!(
+        before,
+        vec![
+            "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+            "AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+            "SortExec: expr=[a@0 ASC], preserve_partitioning=[false]",
+            "ProjectionExec: expr=[a@0 as a, b@1 as value]",
+            "UnionExec",
+            "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+            "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        ],
+    );
+
+    plan
+}
+
+/// Same as [`repartitions_for_aggregate_after_sorted_union`], but adds a projection
+/// as well between the union and aggregate. This change the outcome:
+///
+/// * we no longer get repartitioning, and instead get coalescing.
+#[test]
+fn coalesces_for_aggregate_after_sorted_union_projection() -> Result<()> {
+    let plan = aggregate_over_sorted_union_projection(vec![parquet_exec_with_stats(); 2]);
+
+    // Same as `repartitions_for_aggregate_after_sorted_union`. No error.
+    let checker = check_plan_sanity(plan.clone(), &Default::default());
+    assert!(checker.is_ok());
+
+    // It no longer does a repartition on the first run.
+    // Instead adds a SPM.
+    let expected_after_first_run = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+        "  SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "    RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "      AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+        "        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1",
+        "          SortPreservingMergeExec: [a@0 ASC]",
+        "            SortExec: expr=[a@0 ASC], preserve_partitioning=[true]",
+        "              ProjectionExec: expr=[a@0 as a, b@1 as value]",
+        "                UnionExec",
+        "                  DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "                  DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    let test_config = TestConfig::default().with_batch_size(100);
+    test_config.run(
+        expected_after_first_run,
+        plan.clone(),
+        &DISTRIB_DISTRIB_SORT,
+    )?;
+
+    // Then it removes the SPM, and inserts a coalesace on the second run.
+    let expected_after_second_run = &[
+        "AggregateExec: mode=FinalPartitioned, gby=[a1@0 as a1], aggr=[], ordering_mode=Sorted",
+        "  SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "    RepartitionExec: partitioning=Hash([a1@0], 10), input_partitions=10",
+        "      SortExec: expr=[a1@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "        AggregateExec: mode=Partial, gby=[a@0 as a1], aggr=[], ordering_mode=Sorted",
+        "          SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "            RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
+        "              SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]",
+        "                SortExec: expr=[a@0 ASC], preserve_partitioning=[true]",
+        "                  ProjectionExec: expr=[a@0 as a, b@1 as value]",
+        "                    UnionExec",
+        "                      DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+        "                      DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet",
+    ];
+    test_config.run(expected_after_second_run, plan, &SORT_DISTRIB_DISTRIB)?;
 
     Ok(())
 }
