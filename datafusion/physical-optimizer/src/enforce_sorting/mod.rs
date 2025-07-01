@@ -47,8 +47,8 @@ use crate::enforce_sorting::sort_pushdown::{
     assign_initial_requirements, pushdown_sorts, SortPushDown,
 };
 use crate::utils::{
-    add_sort_above, add_sort_above_with_check, is_coalesce_partitions, is_limit,
-    is_repartition, is_sort, is_sort_preserving_merge, is_union, is_window,
+    add_sort_above, add_sort_above_with_check, is_aggregation, is_coalesce_partitions,
+    is_limit, is_repartition, is_sort, is_sort_preserving_merge, is_union, is_window,
 };
 use crate::PhysicalOptimizerRule;
 
@@ -628,7 +628,7 @@ fn remove_bottleneck_in_subplan(
 ) -> Result<PlanWithCorrespondingCoalescePartitions> {
     let plan = &requirements.plan;
     let children = &mut requirements.children;
-    if is_coalesce_partitions(&children[0].plan) {
+    if is_coalesce_partitions(&children[0].plan) && !is_aggregation(plan) {
         // We can safely use the 0th index since we have a `CoalescePartitionsExec`.
         let mut new_child_node = children[0].children.swap_remove(0);
         while new_child_node.plan.output_partitioning() == plan.output_partitioning()
