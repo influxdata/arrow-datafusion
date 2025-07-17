@@ -33,7 +33,7 @@ use arrow::{
     row::{Row, Rows},
 };
 use datafusion_common::stats::Precision;
-use datafusion_common::{plan_datafusion_err, plan_err, DataFusionError, Result};
+use datafusion_common::{plan_datafusion_err, DataFusionError, Result};
 use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_plan::{ColumnStatistics, Statistics};
@@ -228,14 +228,7 @@ impl MinMaxStatistics {
                 .zip(sort_columns.iter().copied())
                 .map(|(sort_expr, column)| {
                     let schema = values.schema();
-
                     let idx = schema.index_of(column.name())?;
-                    let field = schema.field(idx);
-
-                    // check that sort columns are non-nullable
-                    if field.is_nullable() {
-                        return plan_err!("cannot sort by nullable column");
-                    }
 
                     Ok(SortColumn {
                         values: Arc::clone(values.column(idx)),
