@@ -1370,6 +1370,7 @@ mod tests {
                 Arc::new(window_frame),
                 &input.schema(),
                 false,
+                false,
             )?],
             input,
             input_order_mode,

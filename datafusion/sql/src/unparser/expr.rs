@@ -18,8 +18,9 @@
 use datafusion_expr::expr::{AggregateFunctionParams, Unnest, WindowFunctionParams};
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
-    self, Array, BinaryOperator, CaseWhen, Expr as AstExpr, Function, Ident, Interval,
-    ObjectName, OrderByOptions, Subscript, TimezoneInfo, UnaryOperator, ValueWithSpan,
+    self, Array, BinaryOperator, CaseWhen, DuplicateTreatment, Expr as AstExpr, Function,
+    Ident, Interval, ObjectName, OrderByOptions, Subscript, TimezoneInfo, UnaryOperator,
+    ValueWithSpan,
 };
 use std::sync::Arc;
 use std::vec;
@@ -198,6 +199,7 @@ impl Unparser<'_> {
                             partition_by,
                             order_by,
                             window_frame,
+                            distinct,
                             ..
                         },
                 } = window_fun.as_ref();
@@ -256,7 +258,8 @@ impl Unparser<'_> {
                         span: Span::empty(),
                     }]),
                     args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                        duplicate_treatment: None,
+                        duplicate_treatment: distinct
+                            .then_some(DuplicateTreatment::Distinct),
                         args,
                         clauses: vec![],
                     }),
@@ -313,7 +316,6 @@ impl Unparser<'_> {
                     distinct,
                     args,
                     filter,
-                    order_by,
                     ..
                 } = &agg.params;
 
@@ -321,16 +323,6 @@ impl Unparser<'_> {
                 let filter = match filter {
                     Some(filter) => Some(Box::new(self.expr_to_sql_inner(filter)?)),
                     None => None,
-                };
-                let within_group = if agg.func.is_ordered_set_aggregate() {
-                    order_by
-                        .as_ref()
-                        .unwrap_or(&Vec::new())
-                        .iter()
-                        .map(|sort_expr| self.sort_to_sql(sort_expr))
-                        .collect::<Result<Vec<_>>>()?
-                } else {
-                    Vec::new()
                 };
                 Ok(ast::Expr::Function(Function {
                     name: ObjectName::from(vec![Ident {
@@ -340,14 +332,14 @@ impl Unparser<'_> {
                     }]),
                     args: ast::FunctionArguments::List(ast::FunctionArgumentList {
                         duplicate_treatment: distinct
-                            .then_some(ast::DuplicateTreatment::Distinct),
+                            .then_some(DuplicateTreatment::Distinct),
                         args,
                         clauses: vec![],
                     }),
                     filter,
                     null_treatment: None,
                     over: None,
-                    within_group,
+                    within_group: vec![],
                     parameters: ast::FunctionArguments::None,
                     uses_odbc_syntax: false,
                 }))
@@ -2028,6 +2020,7 @@ mod tests {
                         order_by: vec![],
                         window_frame: WindowFrame::new(None),
                         null_treatment: None,
+                        distinct: false,
                     },
                 }),
                 r#"row_number(col) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"#,
@@ -2053,6 +2046,7 @@ mod tests {
                             ),
                         ),
                         null_treatment: None,
+                        distinct: false,
                     },
                 }),
                 r#"count(*) OVER (ORDER BY a DESC NULLS FIRST RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING)"#,
