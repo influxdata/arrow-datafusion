@@ -712,6 +712,9 @@ impl DefaultPhysicalPlanner {
                             differences.push(format!("field nullability at index {} [{}]: (physical) {} vs (logical) {}", i, physical_field.name(), physical_field.is_nullable(), logical_field.is_nullable()));
                         }
                     }
+
+                    log::warn!("Physical input schema should be the same as the one converted from logical input schema, but did not match for logical plan:\n{}", input.display_indent());
+
                     return internal_err!("Physical input schema should be the same as the one converted from logical input schema. Differences: {}", differences
                         .iter()
                         .map(|s| format!("\n\t- {s}"))
@@ -1646,6 +1649,7 @@ pub fn create_window_expr_with_name(
                         order_by,
                         window_frame,
                         null_treatment,
+                        distinct,
                     },
             } = window_fun.as_ref();
             let physical_args =
@@ -1674,6 +1678,7 @@ pub fn create_window_expr_with_name(
                 window_frame,
                 physical_schema,
                 ignore_nulls,
+                *distinct,
             )
         }
         other => plan_err!("Invalid window expression '{other:?}'"),

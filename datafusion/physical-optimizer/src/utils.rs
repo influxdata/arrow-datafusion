@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use datafusion_common::Result;
 use datafusion_physical_expr::{LexOrdering, LexRequirement};
+use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::repartition::RepartitionExec;
@@ -112,4 +113,9 @@ pub fn is_repartition(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// i.e. either a [`LocalLimitExec`] or a [`GlobalLimitExec`].
 pub fn is_limit(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<GlobalLimitExec>() || plan.as_any().is::<LocalLimitExec>()
+}
+
+/// Checks whether the given operator is a [`AggregateExec`].
+pub fn is_aggregation(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.as_any().is::<AggregateExec>()
 }
