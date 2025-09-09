@@ -265,6 +265,7 @@ pub fn bounded_window_exec_with_partition(
         Arc::new(WindowFrame::new(Some(false))),
         schema.as_ref(),
         false,
+        false,
     )
     .unwrap();
 
@@ -507,6 +508,13 @@ pub fn check_integrity<T: Clone>(context: PlanContext<T>) -> Result<PlanContext<
             Ok(Transformed::no(node))
         })
         .data()
+}
+
+pub fn trim_plan_display(plan: &str) -> Vec<&str> {
+    plan.split('\n')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 // construct a stream partition for test purposes
