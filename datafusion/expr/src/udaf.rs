@@ -458,7 +458,7 @@ pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync {
 
         // exclude the first function argument(= column) in ordered set aggregate function,
         // because it is duplicated with the WITHIN GROUP clause in schema name.
-        let args = if self.is_ordered_set_aggregate() {
+        let args = if self.is_ordered_set_aggregate() && !order_by.is_empty() {
             &args[1..]
         } else {
             &args[..]
