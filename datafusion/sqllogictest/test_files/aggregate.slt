@@ -1287,7 +1287,7 @@ SELECT approx_distinct(c9) AS a, approx_distinct(c9) AS b FROM aggregate_test_10
 ## Column `c12` is omitted due to a large relative error (~10%) due to the small
 ## float values.
 
-#csv_query_approx_percentile_cont (c2)
+# csv_query_approx_percentile_cont (c2)
 query B
 SELECT (ABS(1 - CAST(approx_percentile_cont(0.1) WITHIN GROUP (ORDER BY c2) AS DOUBLE) / 1.0) < 0.05) AS q FROM aggregate_test_100
 ----
@@ -1300,6 +1300,23 @@ true
 
 query B
 SELECT (ABS(1 - CAST(approx_percentile_cont(0.9) WITHIN GROUP (ORDER BY c2) AS DOUBLE) / 5.0) < 0.05) AS q FROM aggregate_test_100
+----
+true
+
+
+# csv_query_approx_percentile_cont (c2, alternate syntax, should be the same as above)
+query B
+SELECT (ABS(1 - CAST(approx_percentile_cont(c2, 0.1) AS DOUBLE) / 1.0) < 0.05) AS q FROM aggregate_test_100
+----
+true
+
+query B
+SELECT (ABS(1 - CAST(approx_percentile_cont(c2, 0.5) AS DOUBLE) / 3.0) < 0.05) AS q FROM aggregate_test_100
+----
+true
+
+query B
+SELECT (ABS(1 - CAST(approx_percentile_cont(c2, 0.9) AS DOUBLE) / 5.0) < 0.05) AS q FROM aggregate_test_100
 ----
 true
 
@@ -1743,6 +1760,40 @@ c 122
 d 124
 e 115
 
+
+# csv_query_approx_percentile_cont_with_weight (should be the same as above)
+query TI
+SELECT c1, approx_percentile_cont(c3, 0.95) AS c3_p95 FROM aggregate_test_100 GROUP BY 1 ORDER BY 1
+----
+a 73
+b 68
+c 122
+d 124
+e 115
+
+
+# using approx_percentile_cont on 2 columns with same signature
+query TII
+SELECT c1, approx_percentile_cont(c2, 0.95) AS c2, approx_percentile_cont(c3, 0.95) AS c3 FROM aggregate_test_100 GROUP BY 1 ORDER BY 1
+----
+a 5 73
+b 5 68
+c 5 122
+d 5 124
+e 5 115
+
+# error is unique to this UDAF
+query TRR
+SELECT c1, avg(c2) AS c2, avg(c3) AS c3 FROM aggregate_test_100 GROUP BY 1 ORDER BY 1
+----
+a 2.857142857143 -18.333333333333
+b 3.263157894737 -5.842105263158
+c 2.666666666667 -1.333333333333
+d 2.444444444444 25.444444444444
+e 3 40.333333333333
+
+
+
 query TI
 SELECT c1, approx_percentile_cont(0.95) WITHIN GROUP (ORDER BY c3 DESC) AS c3_p95 FROM aggregate_test_100 GROUP BY 1 ORDER BY 1
 ----
@@ -1761,6 +1812,17 @@ b 68
 c 122
 d 124
 e 115
+
+# csv_query_approx_percentile_cont_with_weight alternate syntax
+query TI
+SELECT c1, approx_percentile_cont_with_weight(c3, 1, 0.95) AS c3_p95 FROM aggregate_test_100 GROUP BY 1 ORDER BY 1
+----
+a 73
+b 68
+c 122
+d 124
+e 115
+
 
 query TI
 SELECT c1, approx_percentile_cont_with_weight(1, 0.95) WITHIN GROUP (ORDER BY c3 DESC) AS c3_p95 FROM aggregate_test_100 GROUP BY 1 ORDER BY 1
@@ -1783,6 +1845,16 @@ e 115
 
 query TI
 SELECT c1, approx_percentile_cont_with_weight(c2, 0.95) WITHIN GROUP (ORDER BY c3) AS c3_p95 FROM aggregate_test_100 GROUP BY 1 ORDER BY 1
+----
+a 74
+b 68
+c 123
+d 124
+e 115
+
+# approx_percentile_cont_with_weight with centroids
+query TI
+SELECT c1, approx_percentile_cont_with_weight(c2, 0.95, 200) WITHIN GROUP (ORDER BY c3) AS c3_p95 FROM aggregate_test_100 GROUP BY 1 ORDER BY 1
 ----
 a 74
 b 68

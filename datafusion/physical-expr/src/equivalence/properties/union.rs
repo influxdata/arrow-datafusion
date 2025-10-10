@@ -67,16 +67,43 @@ fn calculate_union_binary(
         })
         .collect::<Vec<_>>();
 
+    // TEMP HACK WORKAROUND
+    // Revert code from https://github.com/apache/datafusion/pull/12562
+    // Context: https://github.com/apache/datafusion/issues/13748
+    // Context: https://github.com/influxdata/influxdb_iox/issues/13038
+
     // Next, calculate valid orderings for the union by searching for prefixes
     // in both sides.
-    let mut orderings = UnionEquivalentOrderingBuilder::new();
-    orderings.add_satisfied_orderings(&lhs, &rhs)?;
-    orderings.add_satisfied_orderings(&rhs, &lhs)?;
-    let orderings = orderings.build();
+    let mut orderings = vec![];
+    for ordering in lhs.normalized_oeq_class().into_iter() {
+        let mut ordering: Vec<PhysicalSortExpr> = ordering.into();
 
+        // Progressively shorten the ordering to search for a satisfied prefix:
+        while !rhs.ordering_satisfy(ordering.clone())? {
+            ordering.pop();
+        }
+        // There is a non-trivial satisfied prefix, add it as a valid ordering:
+        if !ordering.is_empty() {
+            orderings.push(ordering);
+        }
+    }
+
+    for ordering in rhs.normalized_oeq_class().into_iter() {
+        let mut ordering: Vec<PhysicalSortExpr> = ordering.into();
+
+        // Progressively shorten the ordering to search for a satisfied prefix:
+        while !lhs.ordering_satisfy(ordering.clone())? {
+            ordering.pop();
+        }
+        // There is a non-trivial satisfied prefix, add it as a valid ordering:
+        if !ordering.is_empty() {
+            orderings.push(ordering);
+        }
+    }
     let mut eq_properties = EquivalenceProperties::new(lhs.schema);
     eq_properties.add_constants(constants)?;
     eq_properties.add_orderings(orderings);
+
     Ok(eq_properties)
 }
 
@@ -122,6 +149,7 @@ struct UnionEquivalentOrderingBuilder {
     orderings: Vec<LexOrdering>,
 }
 
+#[expect(unused)]
 impl UnionEquivalentOrderingBuilder {
     fn new() -> Self {
         Self { orderings: vec![] }
@@ -504,6 +532,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "InfluxData patch: chore: skip order calculation / exponential planning"]
     fn test_union_equivalence_properties_constants_fill_gaps() -> Result<()> {
         let schema = create_test_schema().unwrap();
         UnionEquivalenceTest::new(&schema)
@@ -579,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "InfluxData patch: chore: skip order calculation / exponential planning"]
     fn test_union_equivalence_properties_constants_fill_gaps_non_symmetric() -> Result<()>
     {
         let schema = create_test_schema().unwrap();
@@ -607,6 +637,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "InfluxData patch: chore: skip order calculation / exponential planning"]
     fn test_union_equivalence_properties_constants_gap_fill_symmetric() -> Result<()> {
         let schema = create_test_schema().unwrap();
         UnionEquivalenceTest::new(&schema)
@@ -658,6 +689,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "InfluxData patch: chore: skip order calculation / exponential planning"]
     fn test_union_equivalence_properties_constants_middle_desc() -> Result<()> {
         let schema = create_test_schema().unwrap();
         UnionEquivalenceTest::new(&schema)
@@ -920,5 +952,64 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         ))
+    }
+
+    #[test]
+    fn test_constants_share_values() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("const_1", DataType::Utf8, false),
+            Field::new("const_2", DataType::Utf8, false),
+        ]));
+
+        let col_const_1 = col("const_1", &schema)?;
+        let col_const_2 = col("const_2", &schema)?;
+
+        let literal_foo = ScalarValue::Utf8(Some("foo".to_owned()));
+        let literal_bar = ScalarValue::Utf8(Some("bar".to_owned()));
+
+        let const_expr_1_foo = ConstExpr::new(
+            Arc::clone(&col_const_1),
+            AcrossPartitions::Uniform(Some(literal_foo.clone())),
+        );
+        let const_expr_2_foo = ConstExpr::new(
+            Arc::clone(&col_const_2),
+            AcrossPartitions::Uniform(Some(literal_foo.clone())),
+        );
+        let const_expr_2_bar = ConstExpr::new(
+            Arc::clone(&col_const_2),
+            AcrossPartitions::Uniform(Some(literal_bar.clone())),
+        );
+
+        let mut input1 = EquivalenceProperties::new(Arc::clone(&schema));
+        let mut input2 = EquivalenceProperties::new(Arc::clone(&schema));
+
+        // | Input | Const_1 | Const_2 |
+        // | ----- | ------- | ------- |
+        // |     1 | foo     | foo     |
+        // |     2 | foo     | bar     |
+        input1.add_constants(vec![const_expr_1_foo.clone(), const_expr_2_foo.clone()])?;
+        input2.add_constants(vec![const_expr_1_foo.clone(), const_expr_2_bar.clone()])?;
+
+        // Calculate union properties
+        let union_props = calculate_union(vec![input1, input2], schema)?;
+
+        // This should result in:
+        //   const_1 = Uniform("foo")
+        //   const_2 = Heterogeneous
+        assert_eq!(union_props.constants().len(), 2);
+        let union_const_1 = &union_props.constants()[0];
+        assert!(union_const_1.expr.eq(&col_const_1));
+        assert_eq!(
+            union_const_1.across_partitions,
+            AcrossPartitions::Uniform(Some(literal_foo)),
+        );
+        let union_const_2 = &union_props.constants()[1];
+        assert!(union_const_2.expr.eq(&col_const_2));
+        assert_eq!(
+            union_const_2.across_partitions,
+            AcrossPartitions::Heterogeneous,
+        );
+
+        Ok(())
     }
 }

@@ -99,7 +99,6 @@ arrow-flight = { version = "55.2.0", features = [
 ] }
 arrow-ipc = { version = "55.2.0", default-features = false, features = [
     "lz4",
-    "zstd",
 ] }
 arrow-ord = { version = "55.2.0", default-features = false }
 arrow-schema = { version = "55.2.0", default-features = false }
@@ -198,6 +197,7 @@ rpath = false
 strip = false            # Retain debug info for flamegraphs
 
 [profile.ci]
+debug = false
 inherits = "dev"
 incremental = false
 
