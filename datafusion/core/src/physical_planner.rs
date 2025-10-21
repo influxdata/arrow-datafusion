@@ -802,10 +802,17 @@ impl DefaultPhysicalPlanner {
                             ));
                         }
                     }
-                    return internal_err!(
+                    debug!(
                         "Physical input schema should be the same as the one converted from logical input schema. Differences: {}",
                         differences.iter().map(|s| format!("\n\t- {s}")).join("")
                     );
+
+                    //influx: temporarily remove error and only log so that we can find a
+                    //reproducer in production
+                    // return internal_err!("Physical input schema should be the same as the one converted from logical input schema. Differences: {}", differences
+                    //     .iter()
+                    //     .map(|s| format!("\n\t- {s}"))
+                    //     .join(""));
                 }
 
                 let groups = self.create_grouping_physical_expr(
