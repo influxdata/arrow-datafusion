@@ -710,10 +710,15 @@ impl DefaultPhysicalPlanner {
                             differences.push(format!("field nullability at index {} [{}]: (physical) {} vs (logical) {}", i, physical_field.name(), physical_field.is_nullable(), logical_field.is_nullable()));
                         }
                     }
-                    return internal_err!("Physical input schema should be the same as the one converted from logical input schema. Differences: {}", differences
-                        .iter()
-                        .map(|s| format!("\n\t- {s}"))
-                        .join(""));
+
+                    log::debug!("Physical input schema should be the same as the one converted from logical input schema, but did not match for logical plan:\n{}", input.display_indent());
+
+                    //influx: temporarily remove error and only log so that we can find a
+                    //reproducer in production
+                    // return internal_err!("Physical input schema should be the same as the one converted from logical input schema. Differences: {}", differences
+                    //     .iter()
+                    //     .map(|s| format!("\n\t- {s}"))
+                    //     .join(""));
                 }
 
                 let groups = self.create_grouping_physical_expr(

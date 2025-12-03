@@ -515,6 +515,13 @@ pub fn check_integrity<T: Clone>(context: PlanContext<T>) -> Result<PlanContext<
         .data()
 }
 
+pub fn trim_plan_display(plan: &str) -> Vec<&str> {
+    plan.split('\n')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 // construct a stream partition for test purposes
 #[derive(Debug)]
 pub struct TestStreamPartition {
