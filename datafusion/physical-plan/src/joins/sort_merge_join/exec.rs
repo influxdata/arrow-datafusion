@@ -25,6 +25,7 @@ use std::sync::Arc;
 use super::bitwise_stream::BitwiseSortMergeJoinStream;
 use super::materializing_stream::MaterializingSortMergeJoinStream;
 use super::metrics::SortMergeJoinMetrics;
+use crate::coop::make_cooperative;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::expressions::PhysicalSortExpr;
 use crate::joins::utils::{
@@ -546,7 +547,7 @@ impl ExecutionPlan for SortMergeJoinExec {
         )
         .with_compression_type(context.session_config().spill_compression());
 
-        if matches!(
+        let stream = if matches!(
             self.join_type,
             JoinType::LeftSemi
                 | JoinType::LeftAnti
@@ -589,7 +590,9 @@ impl ExecutionPlan for SortMergeJoinExec {
                 spill_manager,
                 context.runtime_env(),
             )
-        }
+        }?;
+
+        Ok(make_cooperative(stream))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
