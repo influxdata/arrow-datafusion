@@ -25,6 +25,7 @@ use std::sync::Arc;
 use super::bitwise_stream::BitwiseSortMergeJoinStream;
 use super::materializing_stream::MaterializingSortMergeJoinStream;
 use super::metrics::SortMergeJoinMetrics;
+use crate::coop::cooperative;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::expressions::PhysicalSortExpr;
 use crate::joins::utils::{
@@ -522,7 +523,7 @@ impl ExecutionPlan for SortMergeJoinExec {
                 | JoinType::LeftMark
                 | JoinType::RightMark
         ) {
-            Ok(Box::pin(BitwiseSortMergeJoinStream::try_new(
+            Ok(Box::pin(cooperative(BitwiseSortMergeJoinStream::try_new(
                 Arc::clone(&self.schema),
                 self.sort_options.clone(),
                 self.null_equality,
@@ -538,9 +539,9 @@ impl ExecutionPlan for SortMergeJoinExec {
                 reservation,
                 spill_manager,
                 context.runtime_env(),
-            )?))
+            )?)))
         } else {
-            Ok(Box::pin(MaterializingSortMergeJoinStream::try_new(
+            Ok(Box::pin(cooperative(MaterializingSortMergeJoinStream::try_new(
                 Arc::clone(&self.schema),
                 self.sort_options.clone(),
                 self.null_equality,
@@ -555,7 +556,7 @@ impl ExecutionPlan for SortMergeJoinExec {
                 reservation,
                 spill_manager,
                 context.runtime_env(),
-            )?))
+            )?)))
         }
     }
 
