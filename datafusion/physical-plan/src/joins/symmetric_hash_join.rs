@@ -33,6 +33,7 @@ use std::task::{Context, Poll};
 use std::vec;
 
 use crate::common::SharedMemoryReservation;
+use crate::coop::cooperative;
 use crate::execution_plan::{boundedness_from_children, emission_type_from_children};
 use crate::joins::stream_join_utils::{
     calculate_filter_expr_intervals, combine_two_batches,
@@ -532,7 +533,7 @@ impl ExecutionPlan for SymmetricHashJoinExec {
         }
 
         if enforce_batch_size_in_joins {
-            Ok(Box::pin(SymmetricHashJoinStream {
+            Ok(Box::pin(cooperative(SymmetricHashJoinStream {
                 left_stream,
                 right_stream,
                 schema: self.schema(),
@@ -550,9 +551,9 @@ impl ExecutionPlan for SymmetricHashJoinExec {
                 state: SHJStreamState::PullRight,
                 reservation,
                 batch_transformer: BatchSplitter::new(batch_size),
-            }))
+            })))
         } else {
-            Ok(Box::pin(SymmetricHashJoinStream {
+            Ok(Box::pin(cooperative(SymmetricHashJoinStream {
                 left_stream,
                 right_stream,
                 schema: self.schema(),
@@ -570,7 +571,7 @@ impl ExecutionPlan for SymmetricHashJoinExec {
                 state: SHJStreamState::PullRight,
                 reservation,
                 batch_transformer: NoopBatchTransformer::new(),
-            }))
+            })))
         }
     }
 
