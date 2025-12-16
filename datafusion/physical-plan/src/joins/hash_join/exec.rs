@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{any::Any, vec};
 
+use crate::coop::cooperative;
 use crate::execution_plan::{boundedness_from_children, EmissionType};
 use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
@@ -1018,7 +1019,7 @@ impl ExecutionPlan for HashJoinExec {
             .map(|(_, right_expr)| Arc::clone(right_expr))
             .collect::<Vec<_>>();
 
-        Ok(Box::pin(HashJoinStream::new(
+        Ok(Box::pin(cooperative(HashJoinStream::new(
             partition,
             self.schema(),
             on_right,
@@ -1036,7 +1037,7 @@ impl ExecutionPlan for HashJoinExec {
             self.right.output_ordering().is_some(),
             bounds_accumulator,
             self.mode,
-        )))
+        ))))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
