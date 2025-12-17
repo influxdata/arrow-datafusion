@@ -33,6 +33,7 @@ use super::{
     PartitionMode, SharedBitmapBuilder,
 };
 use super::{JoinOn, JoinOnRef};
+use crate::coop::cooperative;
 use crate::execution_plan::{boundedness_from_children, EmissionType};
 use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 use crate::projection::{
@@ -880,7 +881,7 @@ impl ExecutionPlan for HashJoinExec {
             None => self.column_indices.clone(),
         };
 
-        Ok(Box::pin(HashJoinStream {
+        Ok(Box::pin(cooperative(HashJoinStream {
             schema: self.schema(),
             on_right,
             filter: self.filter.clone(),
@@ -895,7 +896,7 @@ impl ExecutionPlan for HashJoinExec {
             batch_size,
             hashes_buffer: vec![],
             right_side_ordered: self.right.output_ordering().is_some(),
-        }))
+        })))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

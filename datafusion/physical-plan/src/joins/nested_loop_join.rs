@@ -30,6 +30,7 @@ use super::utils::{
     StatefulStreamResult,
 };
 use crate::common::can_project;
+use crate::coop::cooperative;
 use crate::execution_plan::{boundedness_from_children, EmissionType};
 use crate::joins::utils::{
     adjust_indices_by_join_type, apply_join_filter_to_indices, build_batch_from_indices,
@@ -530,7 +531,7 @@ impl ExecutionPlan for NestedLoopJoinExec {
             None => self.column_indices.clone(),
         };
 
-        Ok(Box::pin(NestedLoopJoinStream {
+        Ok(Box::pin(cooperative(NestedLoopJoinStream {
             schema: self.schema(),
             filter: self.filter.clone(),
             join_type: self.join_type,
@@ -544,7 +545,7 @@ impl ExecutionPlan for NestedLoopJoinExec {
             left_data: None,
             join_result_status: None,
             intermediate_batch_size: batch_size,
-        }))
+        })))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

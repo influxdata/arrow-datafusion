@@ -25,6 +25,7 @@ use super::utils::{
     BatchTransformer, BuildProbeJoinMetrics, NoopBatchTransformer, OnceAsync, OnceFut,
     StatefulStreamResult,
 };
+use crate::coop::cooperative;
 use crate::execution_plan::{boundedness_from_children, EmissionType};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::{
@@ -324,7 +325,7 @@ impl ExecutionPlan for CrossJoinExec {
         })?;
 
         if enforce_batch_size_in_joins {
-            Ok(Box::pin(CrossJoinStream {
+            Ok(Box::pin(cooperative(CrossJoinStream {
                 schema: Arc::clone(&self.schema),
                 left_fut,
                 right: stream,
@@ -333,9 +334,9 @@ impl ExecutionPlan for CrossJoinExec {
                 state: CrossJoinStreamState::WaitBuildSide,
                 left_data: RecordBatch::new_empty(self.left().schema()),
                 batch_transformer: BatchSplitter::new(batch_size),
-            }))
+            })))
         } else {
-            Ok(Box::pin(CrossJoinStream {
+            Ok(Box::pin(cooperative(CrossJoinStream {
                 schema: Arc::clone(&self.schema),
                 left_fut,
                 right: stream,
@@ -344,7 +345,7 @@ impl ExecutionPlan for CrossJoinExec {
                 state: CrossJoinStreamState::WaitBuildSide,
                 left_data: RecordBatch::new_empty(self.left().schema()),
                 batch_transformer: NoopBatchTransformer::new(),
-            }))
+            })))
         }
     }
 
