@@ -267,7 +267,19 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v4
+      - name: Remove unnecessary preinstalled software
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          # remove tool cache: about 8.5GB (github has host /opt/hostedtoolcache mounted as /__t)
+          rm -rf /__t/* || true
+          # remove Haskell runtime: about 6.3GB (host /usr/local/.ghcup)
+          rm -rf /host/usr/local/.ghcup || true
+          # remove Android library: about 7.8GB (host /usr/local/lib/android)
+          rm -rf /host/usr/local/lib/android || true
+          echo "Disk space after cleanup:"
+          df -h
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
         with:
           submodules: true
           fetch-depth: 1
