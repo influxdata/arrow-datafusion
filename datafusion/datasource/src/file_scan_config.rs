@@ -663,9 +663,10 @@ impl DataSource for FileScanConfig {
 
     fn eq_properties(&self) -> EquivalenceProperties {
         let schema = self.file_source.table_schema().table_schema();
+        let orderings = project_orderings(&self.output_ordering, schema);
         let mut eq_properties = EquivalenceProperties::new_with_orderings(
             Arc::clone(schema),
-            self.output_ordering.clone(),
+            orderings,
         )
         .with_constraints(self.constraints.clone());
 
@@ -1349,7 +1350,7 @@ mod tests {
         verify_sort_integrity,
     };
 
-    use arrow::datatypes::Field;
+    use arrow::datatypes::{Field, Schema, TimeUnit};
     use datafusion_common::stats::Precision;
     use datafusion_common::{ColumnStatistics, internal_err};
     use datafusion_expr::{Operator, SortExpr};
@@ -1843,6 +1844,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn equivalence_properties_reindex_output_ordering_for_partition_cols() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new(
+                "time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
+
+        let table_schema = TableSchema::new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(Field::new(
+                "tag1",
+                wrap_partition_type_in_dict(DataType::Utf8),
+                true,
+            ))],
+        );
+
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        let config = FileScanConfigBuilder::new(
+            object_store_url.clone(),
+            Arc::clone(&file_source),
+        )
+        .with_projection_indices(Some(vec![2, 0, 1]))
+        .unwrap()
+        .with_output_ordering(vec![[
+            PhysicalSortExpr::new_default(Arc::new(Column::new("tag1", 0))),
+            PhysicalSortExpr::new_default(Arc::new(Column::new("time", 1))),
+        ]
+        .into()])
+        .build();
+
+        let eq_properties = config.eq_properties();
+        let ordering = eq_properties
+            .output_ordering()
+            .expect("expected output ordering");
+
+        let mut iter = ordering.iter();
+        let first = iter.next().unwrap();
+        let first_col = first.expr.as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(first_col.name(), "tag1");
+        assert_eq!(first_col.index(), 0);
+
+        let second = iter.next().unwrap();
+        let second_col = second.expr.as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(second_col.name(), "time");
+        assert_eq!(second_col.index(), 2);
     }
 
     #[test]
