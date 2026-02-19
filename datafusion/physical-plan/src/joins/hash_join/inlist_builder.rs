@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StructArray};
+use arrow::compute::take;
 use arrow::datatypes::{Field, FieldRef, Fields};
 use arrow::downcast_dictionary_array;
 use arrow_schema::DataType;
@@ -39,7 +40,8 @@ fn flatten_dictionary_array(array: &ArrayRef) -> ArrayRef {
     downcast_dictionary_array! {
         array => {
             // Recursively flatten in case of nested dictionaries
-            flatten_dictionary_array(array.values())
+            let values = flatten_dictionary_array(array.values());
+            take(&values, array.keys(), None).expect("take should succeed for valid dictionary")
         }
         _ => Arc::clone(array)
     }
@@ -99,8 +101,8 @@ pub(super) fn build_struct_inlist_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, StringArray};
-    use arrow_schema::DataType;
+    use arrow::array::{Int32Array, StringArray, StringDictionaryBuilder};
+    use arrow_schema::{ArrowError, DataType};
     use std::sync::Arc;
 
     #[test]
@@ -129,5 +131,37 @@ mod tests {
                 build_struct_fields(&[DataType::Int32, DataType::Utf8]).unwrap()
             )
         );
+    }
+
+    #[test]
+    fn test_build_multi_column_with_dictionary() -> Result<(), ArrowError> {
+        // Test that dictionary arrays are correctly flattened to match lengths.
+        // This reproduces a bug where dictionary values (unique values only)
+        // were used instead of the expanded array.
+        let array1 = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+
+        // Create a dictionary array with 2 rows but only 1 unique value
+        // keys: [0, 0], values: ["west"]
+        let mut builder = StringDictionaryBuilder::<arrow::datatypes::Int32Type>::new();
+        builder.append_value("west");
+        builder.append_value("west");
+        let dict_array = Arc::new(builder.finish()) as ArrayRef;
+        assert_eq!(dict_array.len(), 2);
+
+        // This should succeed - both arrays have length 2
+        let result = build_struct_inlist_values(&[array1, dict_array])
+            .unwrap()
+            .unwrap();
+
+        // Result should be a struct with 2 rows
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            *result.data_type(),
+            DataType::Struct(
+                build_struct_fields(&[DataType::Int32, DataType::Utf8]).unwrap()
+            )
+        );
+
+        Ok(())
     }
 }
