@@ -135,7 +135,7 @@ impl ScalarUDFImpl for ToUnixtimeFunc {
                 .cast_to(&DataType::Timestamp(TimeUnit::Second, tz), None)?
                 .cast_to(&DataType::Int64, None),
             DataType::Utf8View | DataType::LargeUtf8 | DataType::Utf8 => {
-                ToTimestampSecondsFunc::new_with_config(args.config_options.as_ref())
+                ToTimestampSecondsFunc::new()
                     .invoke_with_args(args)?
                     .cast_to(&DataType::Int64, None)
             }
