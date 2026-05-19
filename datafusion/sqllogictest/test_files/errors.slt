@@ -125,12 +125,38 @@ from aggregate_test_100
 order by c9
 
 # WindowFunction wrong signature
-statement error DataFusion error: Error during planning: Internal error: Function 'nth_value' failed to match any signature
+statement error DataFusion error: Error during planning: The function 'nth_value' expected 2 arguments but received 3
 select
 c9,
 nth_value(c5, 2, 3) over (order by c9) as nv1
 from aggregate_test_100
 order by c9
+
+statement error DataFusion error: Error during planning: The function 'nth_value' expected 2 arguments but received 1
+select
+c9,
+nth_value(c5) over (order by c9) as nv2
+from aggregate_test_100
+order by c9
+
+statement error DataFusion error: Error during planning: The function 'first_value' expected 1 arguments but received 2
+select
+c9,
+first_value(c5, 2) over (order by c9) as fv1
+from aggregate_test_100
+order by c9
+
+statement error DataFusion error: Error during planning: 'nth_value' does not support zero arguments
+select nth_value() over (order by x) from (values (1), (2)) as t(x)
+
+statement error DataFusion error: Error during planning: 'first_value' does not support zero arguments
+select first_value() over (order by x) from (values (1), (2)) as t(x)
+
+query error DataFusion error: Error during planning: Sum not supported for Boolean
+select sum(bool_col) from (values (true), (false), (null)) as t(bool_col);
+
+query error DataFusion error: Error during planning: Avg not supported for Boolean
+select avg(bool_col) from (values (true), (false), (null)) as t(bool_col);
 
 
 # nth_value with wrong name

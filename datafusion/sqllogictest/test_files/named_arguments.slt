@@ -86,7 +86,7 @@ SELECT substr("STR" => 'hello world', "start_pos" => 7);
 
 # Error: wrong number of arguments
 # This query provides only 1 argument but substr requires 2 or 3
-query error Function 'substr' failed to match any signature
+query error DataFusion error: Error during planning: Function 'substr' expects 2 to 3 arguments but received 1
 SELECT substr(str => 'hello world');
 
 #############
