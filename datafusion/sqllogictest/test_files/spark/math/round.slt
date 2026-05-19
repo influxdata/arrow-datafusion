@@ -593,13 +593,13 @@ set datafusion.execution.enable_ansi_mode = false;
 # -------------------------------------------------------------------
 
 # round(string) should fail
-query error Error during planning: Internal error: Function 'round' failed to match any signature
+query error Error during planning: Function 'round' requires one of Decimal, Float32, Float64, Integer, but received String \(DataType: Utf8View\)
 SELECT round('hello'::varchar);
 
 # round(boolean) should fail
-query error Error during planning: Internal error: Function 'round' failed to match any signature
+query error Error during planning: Function 'round' requires one of Decimal, Float32, Float64, Integer, but received Boolean \(DataType: Boolean\)
 SELECT round(true);
 
 # round(timestamp) should fail
-query error Error during planning: Internal error: Function 'round' failed to match any signature
+query error Error during planning: Function 'round' requires one of Decimal, Float32, Float64, Integer, but received Timestamp\(ns\) \(DataType: Timestamp\(ns\)\)
 SELECT round('2023-01-01T00:00:00'::timestamp);

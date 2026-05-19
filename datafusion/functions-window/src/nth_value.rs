@@ -28,7 +28,7 @@ use datafusion_doc::window_doc_sections::DOC_SECTION_ANALYTICAL;
 use datafusion_expr::window_state::WindowAggState;
 use datafusion_expr::{
     Documentation, LimitEffect, Literal, PartitionEvaluator, ReversedUDWF, Signature,
-    TypeSignature, Volatility, WindowUDFImpl,
+    Volatility, WindowUDFImpl,
 };
 use datafusion_functions_window_common::field;
 use datafusion_functions_window_common::partition::PartitionEvaluatorArgs;
@@ -96,17 +96,14 @@ pub struct NthValue {
 impl NthValue {
     /// Create a new `nth_value` function
     pub fn new(kind: NthValueKind) -> Self {
-        Self {
-            signature: Signature::one_of(
-                vec![
-                    TypeSignature::Nullary,
-                    TypeSignature::Any(1),
-                    TypeSignature::Any(2),
-                ],
-                Volatility::Immutable,
-            ),
-            kind,
-        }
+        let signature = match kind {
+            NthValueKind::First | NthValueKind::Last => {
+                Signature::any(1, Volatility::Immutable)
+            }
+            NthValueKind::Nth => Signature::any(2, Volatility::Immutable),
+        };
+
+        Self { signature, kind }
     }
 
     pub fn first() -> Self {

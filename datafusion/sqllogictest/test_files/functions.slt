@@ -208,10 +208,10 @@ SELECT substr('alphabet', NULL, 2)
 ----
 NULL
 
-statement error Function 'substr' failed to match any signature
+statement error DataFusion error: Error during planning: Function 'substr' requires String, but received Int64 \(DataType: Int64\)
 SELECT substr(1, 3)
 
-statement error Function 'substr' failed to match any signature
+statement error DataFusion error: Error during planning: Function 'substr' requires String, but received Int64 \(DataType: Int64\)
 SELECT substr(1, 3, 4)
 
 query T
