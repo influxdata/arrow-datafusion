@@ -31,7 +31,10 @@ use datafusion_common::types::{
     NativeType, logical_float64, logical_int8, logical_int16, logical_int32,
     logical_int64, logical_uint8, logical_uint16, logical_uint32, logical_uint64,
 };
-use datafusion_common::{HashMap, Result, ScalarValue, exec_err, not_impl_err};
+use datafusion_common::{
+    DataFusionError, HashMap, Result, ScalarValue, exec_err, not_impl_err,
+    plan_datafusion_err,
+};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::{AggregateOrderSensitivity, format_state_name};
 use datafusion_expr::{
@@ -208,6 +211,18 @@ impl AggregateUDFImpl for Sum {
 
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+
+    fn diagnose_failed_signature(
+        &self,
+        arg_types: &[DataType],
+    ) -> Option<DataFusionError> {
+        match arg_types {
+            [DataType::Boolean] => {
+                Some(plan_datafusion_err!("Sum not supported for Boolean"))
+            }
+            _ => None,
+        }
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
