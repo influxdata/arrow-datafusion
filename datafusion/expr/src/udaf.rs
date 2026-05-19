@@ -26,7 +26,9 @@ use std::vec;
 
 use arrow::datatypes::{DataType, Field, FieldRef};
 
-use datafusion_common::{Result, ScalarValue, Statistics, exec_err, not_impl_err};
+use datafusion_common::{
+    DataFusionError, Result, ScalarValue, Statistics, exec_err, not_impl_err,
+};
 use datafusion_expr_common::dyn_eq::{DynEq, DynHash};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
@@ -269,6 +271,16 @@ impl AggregateUDF {
 
     pub fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types)
+    }
+
+    /// Returns a function-specific signature failure for argument combinations
+    /// that are better described semantically than by generic signature
+    /// diagnostics.
+    pub fn diagnose_failed_signature(
+        &self,
+        arg_types: &[DataType],
+    ) -> Option<DataFusionError> {
+        self.inner.diagnose_failed_signature(arg_types)
     }
 
     /// See [`AggregateUDFImpl::with_beneficial_ordering`] for more details.
@@ -709,6 +721,16 @@ pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync {
     /// arguments to these specific types.
     fn coerce_types(&self, _arg_types: &[DataType]) -> Result<Vec<DataType>> {
         not_impl_err!("Function {} does not implement coerce_types", self.name())
+    }
+
+    /// Returns a semantic signature failure for argument combinations that
+    /// should be surfaced directly instead of going through generic `OneOf`
+    /// diagnostics.
+    fn diagnose_failed_signature(
+        &self,
+        _arg_types: &[DataType],
+    ) -> Option<DataFusionError> {
+        None
     }
 
     /// If this function is max, return true
@@ -1241,6 +1263,13 @@ impl AggregateUDFImpl for AliasedAggregateUDFImpl {
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types)
+    }
+
+    fn diagnose_failed_signature(
+        &self,
+        arg_types: &[DataType],
+    ) -> Option<DataFusionError> {
+        self.inner.diagnose_failed_signature(arg_types)
     }
 
     fn return_field(&self, arg_fields: &[FieldRef]) -> Result<FieldRef> {
