@@ -569,13 +569,48 @@ set datafusion.execution.enable_ansi_mode = false;
 # -------------------------------------------------------------------
 
 # round(string) should fail
-query error Error during planning: Internal error: Function 'round' failed to match any signature
+query error
 SELECT round('hello'::varchar);
+----
+DataFusion error: Error during planning: Function 'round' requires one of Decimal, Float32, Float64, Integer, but received String (DataType: Utf8View).. No function matches the given name and argument types 'round(Utf8View)'. You might need to add explicit type casts.
+	Candidate functions:
+	round(Decimal, Int32)
+	round(Decimal)
+	round(Integer, Int32)
+	round(Integer)
+	round(Float32, Int32)
+	round(Float32)
+	round(Float64, Int32)
+	round(Float64)
+
 
 # round(boolean) should fail
-query error Error during planning: Internal error: Function 'round' failed to match any signature
+query error
 SELECT round(true);
+----
+DataFusion error: Error during planning: Function 'round' requires one of Decimal, Float32, Float64, Integer, but received Boolean (DataType: Boolean).. No function matches the given name and argument types 'round(Boolean)'. You might need to add explicit type casts.
+	Candidate functions:
+	round(Decimal, Int32)
+	round(Decimal)
+	round(Integer, Int32)
+	round(Integer)
+	round(Float32, Int32)
+	round(Float32)
+	round(Float64, Int32)
+	round(Float64)
+
 
 # round(timestamp) should fail
-query error Error during planning: Internal error: Function 'round' failed to match any signature
+query error
 SELECT round('2023-01-01T00:00:00'::timestamp);
+----
+DataFusion error: Error during planning: Function 'round' requires one of Decimal, Float32, Float64, Integer, but received Timestamp(ns) (DataType: Timestamp(ns)).. No function matches the given name and argument types 'round(Timestamp(ns))'. You might need to add explicit type casts.
+	Candidate functions:
+	round(Decimal, Int32)
+	round(Decimal)
+	round(Integer, Int32)
+	round(Integer)
+	round(Float32, Int32)
+	round(Float32)
+	round(Float64, Int32)
+	round(Float64)

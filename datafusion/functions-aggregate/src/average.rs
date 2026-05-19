@@ -32,7 +32,9 @@ use arrow::datatypes::{
     DurationSecondType, Field, FieldRef, Float64Type, TimeUnit, UInt64Type, i256,
 };
 use datafusion_common::types::{NativeType, logical_float64};
-use datafusion_common::{Result, ScalarValue, exec_err, not_impl_err};
+use datafusion_common::{
+    DataFusionError, Result, ScalarValue, exec_err, not_impl_err, plan_datafusion_err,
+};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
@@ -132,6 +134,18 @@ impl AggregateUDFImpl for Avg {
 
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+
+    fn diagnose_failed_signature(
+        &self,
+        arg_types: &[DataType],
+    ) -> Option<DataFusionError> {
+        match arg_types {
+            [DataType::Boolean] => {
+                Some(plan_datafusion_err!("Avg not supported for Boolean"))
+            }
+            _ => None,
+        }
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
