@@ -257,16 +257,10 @@ impl ExecutionPlan for UnionExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Fast path: optimizer passes frequently rebuild a `UnionExec` with the
-        // same number of children whose schemas are unchanged. In that case the
-        // union schema cannot change either, so we can skip the expensive
-        // `union_schema` recomputation, which is O(children x fields x
-        // metadata clones) and makes repeated rebuilds of wide unions O(n^2)
-        // over the whole optimization run.
-        //
-        // Note that the plan properties (partitioning, orderings, equivalences,
-        // boundedness) CAN legitimately change even when the schemas do not, so
-        // they are always recomputed from the new children.
+        // Fast path: if the children's schemas are unchanged the union schema
+        // cannot change, so skip the O(children x fields) `union_schema`
+        // recomputation. Plan properties can change even when schemas do not,
+        // so they are always recomputed.
         if children.len() == self.inputs.len()
             && children.len() >= 2
             && children.iter().zip(self.inputs.iter()).all(|(new, old)| {
@@ -610,15 +604,10 @@ fn union_schema(inputs: &[Arc<dyn ExecutionPlan>]) -> Result<SchemaRef> {
 
     let first_schema = inputs[0].schema();
 
-    // Fast path: if every input reports a schema identical to the first —
-    // either the same `Arc` or content-equal (`Schema` equality covers field
-    // names, types, nullability, field metadata, and schema metadata, i.e.
-    // every property the merge below reads) — then merging N identical
-    // schemas is the identity operation, so return the first schema directly.
-    // This skips the O(inputs^2 x fields) per-field metadata merge below,
-    // which otherwise dominates planning time for unions of thousands of
-    // structurally-identical children (e.g. generated UNION ALL, or unions
-    // of per-partition scans that all share one table schema).
+    // Merging N identical schemas is the identity operation: if every input
+    // schema is pointer- or content-equal to the first (`Schema` equality
+    // covers every property the merge below reads), return it directly
+    // instead of paying the per-field metadata merge.
     if inputs.iter().all(|input| {
         let schema = input.schema();
         Arc::ptr_eq(&schema, &first_schema) || schema == first_schema

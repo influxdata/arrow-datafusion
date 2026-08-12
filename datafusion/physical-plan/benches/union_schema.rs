@@ -17,21 +17,11 @@
 
 //! Benchmark for `UnionExec` construction cost as a function of child count.
 //!
-//! `UnionExec::try_new` recomputes the union schema by merging every child's
-//! schema (fields, nullability, and per-field metadata). Optimizer passes
-//! rebuild unions via `with_new_children`, so for wide unions this
-//! construction cost is paid many times during planning. The common wide
-//! union — thousands of children that all share one table schema (generated
-//! UNION ALL, unions of per-partition scans) — should be cheap to construct.
-//!
 //! Scenarios:
-//! - `shared_arc`: every child returns the same `Arc<Schema>` (pointer-equal)
-//! - `content_equal`: every child holds its own `Arc<Schema>` with identical
-//!   contents (pointer-distinct; the shape produced by per-partition scan
-//!   subtrees, since each subtree stores its own schema handle)
-//! - `last_differs`: all children content-equal except the last, whose final
-//!   field carries different metadata (adversarial worst case: any fast-path
-//!   equality scan is wasted, then the full merge runs anyway)
+//! - `shared_arc`: every child returns the same `Arc<Schema>`
+//! - `content_equal`: pointer-distinct but identical schemas per child
+//! - `last_differs`: identical except the last child (worst case for any
+//!   equality fast path: the scan is wasted, then the full merge runs)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -108,8 +98,7 @@ fn bench_union_construction(c: &mut Criterion) {
     }
     group.finish();
 
-    // Rebuild storm: the pattern optimizer passes produce — reconstruct the
-    // union once per child edit via `with_new_children`.
+    // Reconstruct the union once per child, as optimizer rewrites do.
     let mut group = c.benchmark_group("union_exec_rebuild_per_child");
     for n in [100, 1000] {
         let children = children_content_equal(n);
