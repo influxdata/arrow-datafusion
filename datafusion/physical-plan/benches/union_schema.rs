@@ -156,17 +156,22 @@ fn bench_union_construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("union_exec_rebuild_per_child");
     let schema = flat_schema();
     for n in [100, 1000] {
-        let children = children_content_equal(&schema, n);
-        let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(children.clone()).unwrap();
-        group.bench_with_input(BenchmarkId::new("content_equal", n), &n, |b, _| {
-            b.iter(|| {
-                let mut plan = Arc::clone(&union);
-                for _ in 0..n {
-                    plan = plan.with_new_children(children.clone()).unwrap();
-                }
-                plan
-            })
-        });
+        for (label, children) in [
+            ("content_equal", children_content_equal(&schema, n)),
+            ("last_differs", children_last_differs(&schema, n)),
+        ] {
+            let union: Arc<dyn ExecutionPlan> =
+                UnionExec::try_new(children.clone()).unwrap();
+            group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
+                b.iter(|| {
+                    let mut plan = Arc::clone(&union);
+                    for _ in 0..n {
+                        plan = plan.with_new_children(children.clone()).unwrap();
+                    }
+                    plan
+                })
+            });
+        }
     }
     group.finish();
 }
