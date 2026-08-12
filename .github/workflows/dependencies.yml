@@ -55,7 +55,7 @@ jobs:
       - name: Check dependencies
         run: |
           cd dev/depcheck
-          cargo run
+          cargo run --locked
 
   detect-unused-dependencies:
     runs-on: ubuntu-latest
