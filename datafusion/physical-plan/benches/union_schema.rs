@@ -95,6 +95,21 @@ fn children_content_equal(schema: &Schema, n: usize) -> Vec<Arc<dyn ExecutionPla
     (0..n).map(|_| child(Arc::new(schema.clone()))).collect()
 }
 
+/// First child keeps `schema`; the rest rename the first field — the common
+/// real-world unequal union (`SELECT a .. UNION ALL SELECT b ..`), where any
+/// equality check fails immediately.
+fn children_names_differ(schema: &Schema, n: usize) -> Vec<Arc<dyn ExecutionPlan>> {
+    let mut fields: Vec<Field> =
+        schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    let first = fields.remove(0);
+    let renamed = first.clone().with_name(format!("renamed_{}", first.name()));
+    fields.insert(0, renamed);
+    let alt = Schema::new(fields);
+    let mut children = vec![child(Arc::new(schema.clone()))];
+    children.extend((1..n).map(|_| child(Arc::new(alt.clone()))));
+    children
+}
+
 fn children_last_differs(schema: &Schema, n: usize) -> Vec<Arc<dyn ExecutionPlan>> {
     let mut children = children_content_equal(schema, n - 1);
     children.push(child(Arc::new(divergent(schema))));
@@ -125,6 +140,12 @@ fn bench_union_construction(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new("last_differs", n),
                 &differs,
+                |b, ch| b.iter(|| UnionExec::try_new(ch.clone()).unwrap()),
+            );
+            let names = children_names_differ(&schema, n);
+            group.bench_with_input(
+                BenchmarkId::new("names_differ", n),
+                &names,
                 |b, ch| b.iter(|| UnionExec::try_new(ch.clone()).unwrap()),
             );
         }
