@@ -17,11 +17,12 @@
 
 //! Benchmark for `UnionExec` construction cost as a function of child count.
 //!
-//! Scenarios:
+//! Scenarios (run against a flat and a nested/struct schema):
 //! - `shared_arc`: every child returns the same `Arc<Schema>`
 //! - `content_equal`: pointer-distinct but identical schemas per child
-//! - `last_differs`: identical except the last child (worst case for any
-//!   equality fast path: the scan is wasted, then the full merge runs)
+//! - `last_differs`: identical except the last child's deepest field (worst
+//!   case for any equality fast path: the scan is wasted, then the full
+//!   merge runs)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,75 +34,126 @@ use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlan;
 
 const NUM_FIELDS: usize = 10;
+const NESTED_CHILDREN: usize = 5;
 const METADATA_PER_FIELD: usize = 2;
 
-fn base_schema() -> Schema {
+fn metadata(tag: &str, i: usize) -> HashMap<String, String> {
+    (0..METADATA_PER_FIELD)
+        .map(|m| (format!("key_{m}"), format!("value_{tag}_{i}_{m}")))
+        .collect()
+}
+
+fn flat_schema() -> Schema {
     let fields: Vec<Field> = (0..NUM_FIELDS)
         .map(|i| {
-            let mut md = HashMap::new();
-            for m in 0..METADATA_PER_FIELD {
-                md.insert(format!("key_{m}"), format!("value_{i}_{m}"));
-            }
-            Field::new(format!("col_{i}"), DataType::Int64, true).with_metadata(md)
+            Field::new(format!("col_{i}"), DataType::Int64, true)
+                .with_metadata(metadata("f", i))
         })
         .collect();
     Schema::new(fields)
 }
 
-fn children_shared_arc(n: usize) -> Vec<Arc<dyn ExecutionPlan>> {
-    let schema: SchemaRef = Arc::new(base_schema());
-    (0..n)
-        .map(|_| Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>)
-        .collect()
-}
-
-fn children_content_equal(n: usize) -> Vec<Arc<dyn ExecutionPlan>> {
-    let schema = base_schema();
-    (0..n)
-        .map(|_| {
-            Arc::new(EmptyExec::new(Arc::new(schema.clone()))) as Arc<dyn ExecutionPlan>
+fn nested_schema() -> Schema {
+    let fields: Vec<Field> = (0..NUM_FIELDS)
+        .map(|i| {
+            let children: Vec<Field> = (0..NESTED_CHILDREN)
+                .map(|c| {
+                    Field::new(format!("sub_{i}_{c}"), DataType::Int64, true)
+                        .with_metadata(metadata("n", i * NESTED_CHILDREN + c))
+                })
+                .collect();
+            Field::new(format!("col_{i}"), DataType::Struct(children.into()), true)
+                .with_metadata(metadata("s", i))
         })
-        .collect()
+        .collect();
+    Schema::new(fields)
 }
 
-fn children_last_differs(n: usize) -> Vec<Arc<dyn ExecutionPlan>> {
-    let mut children = children_content_equal(n - 1);
-    let schema = base_schema();
+/// Clone `schema` with extra metadata on its deepest last field, so equality
+/// checks succeed on everything before failing at the very end.
+fn divergent(schema: &Schema) -> Schema {
     let mut fields: Vec<Field> =
         schema.fields().iter().map(|f| f.as_ref().clone()).collect();
     let last = fields.pop().unwrap();
-    let mut md = last.metadata().clone();
-    md.insert("divergent".to_string(), "true".to_string());
-    fields.push(last.with_metadata(md));
-    children.push(Arc::new(EmptyExec::new(Arc::new(Schema::new(fields)))) as _);
+    let last = match last.data_type() {
+        DataType::Struct(children) => {
+            let mut children: Vec<Field> =
+                children.iter().map(|f| f.as_ref().clone()).collect();
+            let sub = children.pop().unwrap();
+            let mut md = sub.metadata().clone();
+            md.insert("divergent".to_string(), "true".to_string());
+            children.push(sub.with_metadata(md));
+            Field::new(
+                last.name(),
+                DataType::Struct(children.into()),
+                last.is_nullable(),
+            )
+            .with_metadata(last.metadata().clone())
+        }
+        _ => {
+            let mut md = last.metadata().clone();
+            md.insert("divergent".to_string(), "true".to_string());
+            last.with_metadata(md)
+        }
+    };
+    fields.push(last);
+    Schema::new(fields)
+}
+
+fn child(schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
+    Arc::new(EmptyExec::new(schema))
+}
+
+fn children_shared_arc(schema: &Schema, n: usize) -> Vec<Arc<dyn ExecutionPlan>> {
+    let schema: SchemaRef = Arc::new(schema.clone());
+    (0..n).map(|_| child(Arc::clone(&schema))).collect()
+}
+
+fn children_content_equal(schema: &Schema, n: usize) -> Vec<Arc<dyn ExecutionPlan>> {
+    (0..n).map(|_| child(Arc::new(schema.clone()))).collect()
+}
+
+fn children_last_differs(schema: &Schema, n: usize) -> Vec<Arc<dyn ExecutionPlan>> {
+    let mut children = children_content_equal(schema, n - 1);
+    children.push(child(Arc::new(divergent(schema))));
     children
 }
 
 fn bench_union_construction(c: &mut Criterion) {
-    let mut group = c.benchmark_group("union_exec_try_new");
-    for n in [100, 1000, 4000] {
-        let shared = children_shared_arc(n);
-        let content = children_content_equal(n);
-        let differs = children_last_differs(n);
+    for (suffix, schema, sizes) in [
+        ("", flat_schema(), &[100usize, 1000, 4000][..]),
+        ("_nested", nested_schema(), &[1000, 4000][..]),
+    ] {
+        let mut group = c.benchmark_group(format!("union_exec_try_new{suffix}"));
+        for &n in sizes {
+            let shared = children_shared_arc(&schema, n);
+            let content = children_content_equal(&schema, n);
+            let differs = children_last_differs(&schema, n);
 
-        group.bench_with_input(BenchmarkId::new("shared_arc", n), &shared, |b, ch| {
-            b.iter(|| UnionExec::try_new(ch.clone()).unwrap())
-        });
-        group.bench_with_input(
-            BenchmarkId::new("content_equal", n),
-            &content,
-            |b, ch| b.iter(|| UnionExec::try_new(ch.clone()).unwrap()),
-        );
-        group.bench_with_input(BenchmarkId::new("last_differs", n), &differs, |b, ch| {
-            b.iter(|| UnionExec::try_new(ch.clone()).unwrap())
-        });
+            group.bench_with_input(
+                BenchmarkId::new("shared_arc", n),
+                &shared,
+                |b, ch| b.iter(|| UnionExec::try_new(ch.clone()).unwrap()),
+            );
+            group.bench_with_input(
+                BenchmarkId::new("content_equal", n),
+                &content,
+                |b, ch| b.iter(|| UnionExec::try_new(ch.clone()).unwrap()),
+            );
+            group.bench_with_input(
+                BenchmarkId::new("last_differs", n),
+                &differs,
+                |b, ch| b.iter(|| UnionExec::try_new(ch.clone()).unwrap()),
+            );
+        }
+        group.finish();
     }
-    group.finish();
 
     // Reconstruct the union once per child, as optimizer rewrites do.
     let mut group = c.benchmark_group("union_exec_rebuild_per_child");
+    let schema = flat_schema();
     for n in [100, 1000] {
-        let children = children_content_equal(n);
+        let children = children_content_equal(&schema, n);
         let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(children.clone()).unwrap();
         group.bench_with_input(BenchmarkId::new("content_equal", n), &n, |b, _| {
             b.iter(|| {
