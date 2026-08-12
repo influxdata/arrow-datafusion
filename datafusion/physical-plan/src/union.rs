@@ -278,6 +278,26 @@ impl ExecutionPlan for UnionExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         check_if_same_properties!(self, children);
+        // Fast path: if the children's schemas are unchanged the union schema
+        // cannot change, so skip the O(children x fields) `union_schema`
+        // recomputation. Plan properties can change even when schemas do not,
+        // so they are always recomputed.
+        if children.len() == self.inputs.len()
+            && children.len() >= 2
+            && children.iter().zip(self.inputs.iter()).all(|(new, old)| {
+                let new_schema = new.schema();
+                let old_schema = old.schema();
+                Arc::ptr_eq(&new_schema, &old_schema) || new_schema == old_schema
+            })
+        {
+            let schema = self.schema();
+            let cache = Self::compute_properties(&children, schema)?;
+            return Ok(Arc::new(UnionExec {
+                inputs: children,
+                metrics: ExecutionPlanMetricsSet::new(),
+                cache: Arc::new(cache),
+            }));
+        }
         UnionExec::try_new(children)
     }
 
@@ -704,6 +724,17 @@ fn union_schema(inputs: &[Arc<dyn ExecutionPlan>]) -> Result<SchemaRef> {
                  Input 0 has {first_field_count} fields, but input {idx} has {field_count} fields"
             );
         }
+    }
+
+    // Merging N identical schemas is the identity operation: if every input
+    // schema is pointer- or content-equal to the first (`Schema` equality
+    // covers every property the merge below reads), return it directly
+    // instead of paying the per-field metadata merge.
+    if inputs.iter().all(|input| {
+        let schema = input.schema();
+        Arc::ptr_eq(&schema, &first_schema) || schema == first_schema
+    }) {
+        return Ok(first_schema);
     }
 
     let fields = (0..first_field_count)
