@@ -69,34 +69,16 @@ fn nested_schema() -> Schema {
     Schema::new(fields)
 }
 
-/// Clone `schema` with extra metadata on its deepest last field, so equality
-/// checks succeed on everything before failing at the very end.
+/// Clone `schema` with extra metadata on its last field. Divergence must stay
+/// at the top level: differing nested fields change the field `DataType`
+/// itself, which `UnionExec::try_new` rejects ("Schemas have to be aligned").
 fn divergent(schema: &Schema) -> Schema {
     let mut fields: Vec<Field> =
         schema.fields().iter().map(|f| f.as_ref().clone()).collect();
     let last = fields.pop().unwrap();
-    let last = match last.data_type() {
-        DataType::Struct(children) => {
-            let mut children: Vec<Field> =
-                children.iter().map(|f| f.as_ref().clone()).collect();
-            let sub = children.pop().unwrap();
-            let mut md = sub.metadata().clone();
-            md.insert("divergent".to_string(), "true".to_string());
-            children.push(sub.with_metadata(md));
-            Field::new(
-                last.name(),
-                DataType::Struct(children.into()),
-                last.is_nullable(),
-            )
-            .with_metadata(last.metadata().clone())
-        }
-        _ => {
-            let mut md = last.metadata().clone();
-            md.insert("divergent".to_string(), "true".to_string());
-            last.with_metadata(md)
-        }
-    };
-    fields.push(last);
+    let mut md = last.metadata().clone();
+    md.insert("divergent".to_string(), "true".to_string());
+    fields.push(last.with_metadata(md));
     Schema::new(fields)
 }
 
