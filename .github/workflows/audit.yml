@@ -28,11 +28,15 @@ on:
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
 
   pull_request:
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
   
   merge_group:
 
