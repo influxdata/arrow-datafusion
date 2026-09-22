@@ -704,6 +704,7 @@ impl RecordBatchStream for BatchSplitStream {
 /// A stream that holds a memory reservation for its lifetime,
 /// shrinking the reservation as batches are consumed.
 /// The original reservation must have its batch sizes calculated using [`get_record_batch_memory_size`]
+/// or [`get_record_batches_memory_size`](datafusion_common::utils::memory::get_record_batches_memory_size).
 /// On error, the reservation is *NOT* freed, until the stream is dropped.
 pub(crate) struct ReservationStream {
     schema: SchemaRef,
@@ -738,8 +739,14 @@ impl Stream for ReservationStream {
             Poll::Ready(res) => {
                 match res {
                     Some(Ok(batch)) => {
-                        self.reservation
-                            .shrink(get_record_batch_memory_size(&batch));
+                        // Batches may share buffers (e.g. dictionary values
+                        // after `take`), so their individual sizes can add up
+                        // to more than was reserved for all of them together.
+                        // Release at most what is left; the remainder is freed
+                        // when the stream ends.
+                        let size = get_record_batch_memory_size(&batch)
+                            .min(self.reservation.size());
+                        self.reservation.shrink(size);
                         Poll::Ready(Some(Ok(batch)))
                     }
                     Some(Err(err)) => Poll::Ready(Some(Err(err))),

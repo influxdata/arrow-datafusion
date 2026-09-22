@@ -131,12 +131,22 @@ pub fn estimate_memory_size<T>(num_elements: usize, fixed_size: usize) -> Result
 /// `Buffer`. This method provides temporary fix until the issue is resolved:
 /// <https://github.com/apache/arrow-rs/issues/6439>
 pub fn get_record_batch_memory_size(batch: &RecordBatch) -> usize {
+    get_record_batches_memory_size(std::iter::once(batch))
+}
+
+/// Calculate total used memory of `batches`, counting a `Buffer` shared by
+/// several batches (e.g. dictionary values across `take`n chunks) only once.
+///
+/// See [`get_record_batch_memory_size`] for the per-batch semantics.
+pub fn get_record_batches_memory_size<'a>(
+    batches: impl IntoIterator<Item = &'a RecordBatch>,
+) -> usize {
     // Store pointers to `Buffer`'s start memory address (instead of actual
     // used data region's pointer represented by current `Array`)
     let mut counted_buffers: HashSet<NonNull<u8>> = HashSet::new();
     let mut total_size = 0;
 
-    for array in batch.columns() {
+    for array in batches.into_iter().flat_map(|batch| batch.columns()) {
         let array_data = array.to_data();
         count_array_data_memory_size(&array_data, &mut counted_buffers, &mut total_size);
     }
@@ -293,6 +303,35 @@ mod record_batch_tests {
         let size_sliced = get_record_batch_memory_size(&batch_sliced);
 
         assert_eq!(size_origin, size_sliced);
+    }
+
+    #[test]
+    fn test_get_record_batches_memory_size_shared_buffer() {
+        let original = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let slice1 = original.slice(0, 3);
+        let slice2 = original.slice(2, 3);
+
+        let schema_origin = Arc::new(Schema::new(vec![Field::new(
+            "origin_col",
+            DataType::Int32,
+            false,
+        )]));
+        let batch_origin =
+            RecordBatch::try_new(Arc::clone(&schema_origin), vec![Arc::new(original)])
+                .unwrap();
+        let batch_slice1 =
+            RecordBatch::try_new(Arc::clone(&schema_origin), vec![Arc::new(slice1)])
+                .unwrap();
+        let batch_slice2 =
+            RecordBatch::try_new(schema_origin, vec![Arc::new(slice2)]).unwrap();
+
+        let size_origin = get_record_batch_memory_size(&batch_origin);
+        let size_slices = get_record_batches_memory_size([&batch_slice1, &batch_slice2]);
+        let size_summed = get_record_batch_memory_size(&batch_slice1)
+            + get_record_batch_memory_size(&batch_slice2);
+
+        assert_eq!(size_origin, size_slices);
+        assert_eq!(size_summed, 2 * size_origin);
     }
 
     #[test]
