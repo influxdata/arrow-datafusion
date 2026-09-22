@@ -1459,6 +1459,7 @@ mod tests {
     use datafusion_common::{DataFusionError, Result, ScalarValue};
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_physical_expr::EquivalenceProperties;
     use datafusion_physical_expr::expressions::{Column, Literal};
@@ -1740,6 +1741,66 @@ mod tests {
             "Assertion failed: expected a ResourcesExhausted error, but got: {err:?}"
         );
 
+        Ok(())
+    }
+
+    /// A single large batch with a dictionary column: `sort_batch_chunked`
+    /// shares the dictionary values across every output chunk, but the
+    /// reservation for the sorted output charges it once per chunk.
+    #[tokio::test]
+    async fn test_sort_single_batch_shared_dictionary_reservation() -> Result<()> {
+        const ROWS: usize = 100_000;
+        const CARDINALITY: usize = 50_000;
+        const BATCH_SIZE: usize = 1_000;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("time", DataType::Int64, false),
+        ]));
+        let mut tag = StringDictionaryBuilder::<Int32Type>::new();
+        for i in 0..ROWS {
+            tag.append_value(format!("truck_{:05}", (i * 7919) % CARDINALITY));
+        }
+        let time = Int64Array::from_iter_values((0..ROWS).rev().map(|i| i as i64));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(tag.finish()), Arc::new(time)],
+        )?;
+        let input_bytes = get_record_batch_memory_size(&batch);
+
+        // Room for the input several times over, but not for the dictionary
+        // once per chunk. No disk manager, so the sort cannot spill.
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(input_bytes * 4, 1.0)
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+            )
+            .build_arc()?;
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(BATCH_SIZE))
+                .with_runtime(runtime),
+        );
+
+        let plan =
+            TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let sort_exec = Arc::new(SortExec::new(
+            [
+                PhysicalSortExpr::new_default(col("tag", &schema)?),
+                PhysicalSortExpr::new_default(col("time", &schema)?),
+            ]
+            .into(),
+            plan,
+        ));
+
+        let result = collect(sort_exec, task_ctx).await?;
+        let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, ROWS);
+        assert_eq!(result.len(), ROWS.div_ceil(BATCH_SIZE));
         Ok(())
     }
 
