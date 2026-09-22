@@ -50,6 +50,7 @@ use crate::{
     ExecutionPlanProperties, Partitioning, PlanProperties, SendableRecordBatchStream,
     Statistics,
 };
+use datafusion_common::utils::memory::get_record_batches_memory_size;
 
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, StringViewArray};
 use arrow::compute::{concat_batches, lexsort_to_indices, take_arrays};
@@ -732,10 +733,7 @@ impl ExternalSorter {
             // Using try_resize avoids a release-then-reacquire cycle, which
             // matters for MemoryPool implementations where grow/shrink have
             // non-trivial cost (e.g. JNI calls in Comet).
-            let total_sorted_size: usize = sorted_batches
-                .iter()
-                .map(get_record_batch_memory_size)
-                .sum();
+            let total_sorted_size = get_record_batches_memory_size(&sorted_batches);
             reservation
                 .try_resize(total_sorted_size)
                 .map_err(Self::err_with_oom_context)?;
