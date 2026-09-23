@@ -44,6 +44,12 @@ fn make_settings() -> Settings {
     settings
 }
 
+/// Registry override for the image pinned by `testcontainers-modules`.
+///
+/// MinIO withdrew `minio/minio` from Docker Hub on 2026-09-11. quay.io still
+/// serves the same tags. Backport of apache/datafusion#25216.
+const MINIO_IMAGE_NAME: &str = "quay.io/minio/minio";
+
 async fn setup_minio_container() -> ContainerAsync<minio::MinIO> {
     const MINIO_ROOT_USER: &str = "TEST-DataFusionLogin";
     const MINIO_ROOT_PASSWORD: &str = "TEST-DataFusionPassword";
@@ -56,6 +62,7 @@ async fn setup_minio_container() -> ContainerAsync<minio::MinIO> {
         .expect("Failed to get absolute path for test data");
 
     let container = minio::MinIO::default()
+        .with_name(MINIO_IMAGE_NAME)
         .with_env_var("MINIO_ROOT_USER", MINIO_ROOT_USER)
         .with_env_var("MINIO_ROOT_PASSWORD", MINIO_ROOT_PASSWORD)
         .with_mount(Mount::bind_mount(
