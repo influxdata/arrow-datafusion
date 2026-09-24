@@ -131,27 +131,29 @@ pub fn estimate_memory_size<T>(num_elements: usize, fixed_size: usize) -> Result
 /// `Buffer`. This method provides temporary fix until the issue is resolved:
 /// <https://github.com/apache/arrow-rs/issues/6439>
 pub fn get_record_batch_memory_size(batch: &RecordBatch) -> usize {
-    get_record_batches_memory_size(std::iter::once(batch))
+    get_record_batches_memory_size(std::slice::from_ref(batch))
 }
 
 /// Calculate total used memory of `batches`, counting a `Buffer` shared by
-/// several batches (e.g. dictionary values across `take`n chunks) only once.
-///
-/// See [`get_record_batch_memory_size`] for the per-batch semantics.
-pub fn get_record_batches_memory_size<'a>(
-    batches: impl IntoIterator<Item = &'a RecordBatch>,
-) -> usize {
-    // Store pointers to `Buffer`'s start memory address (instead of actual
-    // used data region's pointer represented by current `Array`)
-    let mut counted_buffers: HashSet<NonNull<u8>> = HashSet::new();
-    let mut total_size = 0;
+/// several batches only once.
+pub fn get_record_batches_memory_size(batches: &[RecordBatch]) -> usize {
+    get_record_batches_release_sizes(batches).into_iter().sum()
+}
 
-    for array in batches.into_iter().flat_map(|batch| batch.columns()) {
-        let array_data = array.to_data();
-        count_array_data_memory_size(&array_data, &mut counted_buffers, &mut total_size);
+/// Memory each of `batches` releases when consumed in order: a `Buffer`
+/// shared by several batches is charged to the last batch that references it.
+pub fn get_record_batches_release_sizes(batches: &[RecordBatch]) -> Vec<usize> {
+    let mut counted_buffers: HashSet<NonNull<u8>> = HashSet::new();
+    let mut sizes = vec![0; batches.len()];
+
+    for (size, batch) in sizes.iter_mut().zip(batches).rev() {
+        for array in batch.columns() {
+            let array_data = array.to_data();
+            count_array_data_memory_size(&array_data, &mut counted_buffers, size);
+        }
     }
 
-    total_size
+    sizes
 }
 
 /// Count the memory usage of `array_data` and its children recursively.
@@ -311,27 +313,21 @@ mod record_batch_tests {
         let slice1 = original.slice(0, 3);
         let slice2 = original.slice(2, 3);
 
-        let schema_origin = Arc::new(Schema::new(vec![Field::new(
-            "origin_col",
-            DataType::Int32,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
         let batch_origin =
-            RecordBatch::try_new(Arc::clone(&schema_origin), vec![Arc::new(original)])
-                .unwrap();
-        let batch_slice1 =
-            RecordBatch::try_new(Arc::clone(&schema_origin), vec![Arc::new(slice1)])
-                .unwrap();
-        let batch_slice2 =
-            RecordBatch::try_new(schema_origin, vec![Arc::new(slice2)]).unwrap();
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(original)]).unwrap();
+        let slices = [
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(slice1)]).unwrap(),
+            RecordBatch::try_new(schema, vec![Arc::new(slice2)]).unwrap(),
+        ];
 
         let size_origin = get_record_batch_memory_size(&batch_origin);
-        let size_slices = get_record_batches_memory_size([&batch_slice1, &batch_slice2]);
-        let size_summed = get_record_batch_memory_size(&batch_slice1)
-            + get_record_batch_memory_size(&batch_slice2);
-
-        assert_eq!(size_origin, size_slices);
-        assert_eq!(size_summed, 2 * size_origin);
+        assert_eq!(get_record_batches_memory_size(&slices), size_origin);
+        assert_eq!(
+            get_record_batches_release_sizes(&slices),
+            vec![0, size_origin]
+        );
     }
 
     #[test]
