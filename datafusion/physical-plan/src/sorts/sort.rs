@@ -49,7 +49,7 @@ use crate::{
     ExecutionPlanProperties, Partitioning, PlanProperties, SendableRecordBatchStream,
     Statistics,
 };
-use datafusion_common::utils::memory::get_record_batches_release_sizes;
+use datafusion_common::utils::memory::RecordBatchMemoryCounter;
 
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, StringViewArray};
 use arrow::compute::{concat_batches, lexsort_to_indices, take_arrays};
@@ -732,9 +732,18 @@ impl ExternalSorter {
             // Using try_resize avoids a release-then-reacquire cycle, which
             // matters for MemoryPool implementations where grow/shrink have
             // non-trivial cost (e.g. JNI calls in Comet).
-            let release_sizes = get_record_batches_release_sizes(&sorted_batches);
+            // Chunks share buffers (e.g. dictionary values after `take`), so
+            // count each buffer once and release it with the last chunk that
+            // references it.
+            let mut counter = RecordBatchMemoryCounter::new();
+            let mut release_sizes: Vec<usize> = sorted_batches
+                .iter()
+                .rev()
+                .map(|batch| counter.count_batch(batch))
+                .collect();
+            release_sizes.reverse();
             reservation
-                .try_resize(release_sizes.iter().sum())
+                .try_resize(counter.memory_usage())
                 .map_err(Self::err_with_oom_context)?;
 
             let batches = sorted_batches.into_iter().zip(release_sizes).map(
@@ -1454,7 +1463,6 @@ mod tests {
     use datafusion_common::cast::as_primitive_array;
     use datafusion_common::config::ConfigOptions;
     use datafusion_common::test_util::batches_to_string;
-    use datafusion_common::utils::memory::get_record_batches_memory_size;
     use datafusion_common::{DataFusionError, Result, ScalarValue};
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
@@ -1797,6 +1805,11 @@ mod tests {
         Ok((sort_exec, task_ctx))
     }
 
+    fn batches_memory_size(batches: &[RecordBatch]) -> usize {
+        let mut counter = RecordBatchMemoryCounter::new();
+        batches.iter().map(|batch| counter.count_batch(batch)).sum()
+    }
+
     #[tokio::test]
     async fn test_sort_single_batch_shared_dictionary_reservation() -> Result<()> {
         const ROWS: usize = 100_000;
@@ -1828,7 +1841,7 @@ mod tests {
             drop(stream.next().await.unwrap()?);
             assert_eq!(
                 task_ctx.memory_pool().reserved(),
-                get_record_batches_memory_size(&expected[emitted..]),
+                batches_memory_size(&expected[emitted..]),
                 "after {emitted} of {} batches",
                 expected.len()
             );
