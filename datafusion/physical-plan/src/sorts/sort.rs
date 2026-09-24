@@ -1743,15 +1743,9 @@ mod tests {
         Ok(())
     }
 
-    /// A single large batch with a dictionary column: `sort_batch_chunked`
-    /// shares the dictionary values across every output chunk, but the
-    /// reservation for the sorted output charges it once per chunk.
-    #[tokio::test]
-    async fn test_sort_single_batch_shared_dictionary_reservation() -> Result<()> {
-        const ROWS: usize = 100_000;
-        const CARDINALITY: usize = 50_000;
-        const BATCH_SIZE: usize = 1_000;
-
+    /// One batch whose `tag` dictionary is shared by every chunk of its sorted
+    /// output.
+    fn shared_dictionary_batch(rows: usize) -> Result<RecordBatch> {
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "tag",
@@ -1761,30 +1755,35 @@ mod tests {
             Field::new("time", DataType::Int64, false),
         ]));
         let mut tag = StringDictionaryBuilder::<Int32Type>::new();
-        for i in 0..ROWS {
-            tag.append_value(format!("truck_{:05}", (i * 7919) % CARDINALITY));
+        for i in 0..rows {
+            tag.append_value(format!("truck_{:05}", (i * 7919) % (rows / 2)));
         }
-        let time = Int64Array::from_iter_values((0..ROWS).rev().map(|i| i as i64));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
+        let time = Int64Array::from_iter_values((0..rows).rev().map(|i| i as i64));
+        Ok(RecordBatch::try_new(
+            schema,
             vec![Arc::new(tag.finish()), Arc::new(time)],
-        )?;
-        let input_bytes = get_record_batch_memory_size(&batch);
+        )?)
+    }
 
-        // Room for the input several times over, but not for the dictionary
-        // once per chunk. No disk manager, so the sort cannot spill.
+    /// `SortExec` on `batch` by `(tag, time)` with a `batch_size`-row output,
+    /// a pool of `pool_batches` times the input and no disk manager.
+    fn shared_dictionary_sort(
+        batch: RecordBatch,
+        batch_size: usize,
+        pool_batches: usize,
+    ) -> Result<(Arc<SortExec>, Arc<TaskContext>)> {
+        let schema = batch.schema();
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_limit(input_bytes * 4, 1.0)
+            .with_memory_limit(get_record_batch_memory_size(&batch) * pool_batches, 1.0)
             .with_disk_manager_builder(
                 DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
             )
             .build_arc()?;
         let task_ctx = Arc::new(
             TaskContext::default()
-                .with_session_config(SessionConfig::new().with_batch_size(BATCH_SIZE))
+                .with_session_config(SessionConfig::new().with_batch_size(batch_size))
                 .with_runtime(runtime),
         );
-
         let plan =
             TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
         let sort_exec = Arc::new(SortExec::new(
@@ -1795,6 +1794,16 @@ mod tests {
             .into(),
             plan,
         ));
+        Ok((sort_exec, task_ctx))
+    }
+
+    #[tokio::test]
+    async fn test_sort_single_batch_shared_dictionary_reservation() -> Result<()> {
+        const ROWS: usize = 100_000;
+        const BATCH_SIZE: usize = 1_000;
+
+        let (sort_exec, task_ctx) =
+            shared_dictionary_sort(shared_dictionary_batch(ROWS)?, BATCH_SIZE, 4)?;
 
         let result = collect(sort_exec, task_ctx).await?;
         let rows: usize = result.iter().map(|b| b.num_rows()).sum();
@@ -1808,46 +1817,9 @@ mod tests {
         const ROWS: usize = 10_000;
         const BATCH_SIZE: usize = 1_000;
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "tag",
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                false,
-            ),
-            Field::new("time", DataType::Int64, false),
-        ]));
-        let mut tag = StringDictionaryBuilder::<Int32Type>::new();
-        for i in 0..ROWS {
-            tag.append_value(format!("truck_{:05}", (i * 7919) % ROWS));
-        }
-        let time = Int64Array::from_iter_values((0..ROWS).rev().map(|i| i as i64));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(tag.finish()), Arc::new(time)],
-        )?;
-
-        let expressions: LexOrdering = [
-            PhysicalSortExpr::new_default(col("tag", &schema)?),
-            PhysicalSortExpr::new_default(col("time", &schema)?),
-        ]
-        .into();
-        let expected = sort_batch_chunked(&batch, &expressions, BATCH_SIZE)?;
-
-        let runtime = RuntimeEnvBuilder::new()
-            .with_memory_limit(get_record_batch_memory_size(&batch) * 4, 1.0)
-            .with_disk_manager_builder(
-                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
-            )
-            .build_arc()?;
-        let task_ctx = Arc::new(
-            TaskContext::default()
-                .with_session_config(SessionConfig::new().with_batch_size(BATCH_SIZE))
-                .with_runtime(runtime),
-        );
-
-        let plan =
-            TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
-        let sort_exec = SortExec::new(expressions, plan);
+        let batch = shared_dictionary_batch(ROWS)?;
+        let (sort_exec, task_ctx) = shared_dictionary_sort(batch.clone(), BATCH_SIZE, 4)?;
+        let expected = sort_batch_chunked(&batch, sort_exec.expr(), BATCH_SIZE)?;
         let mut stream = sort_exec.execute(0, Arc::clone(&task_ctx))?;
 
         // Emitted batches are dropped right away; the pool must still hold
@@ -1862,6 +1834,20 @@ mod tests {
             );
         }
         assert!(stream.next().await.is_none());
+        assert_eq!(task_ctx.memory_pool().reserved(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sort_shared_dictionary_release_on_drop() -> Result<()> {
+        let (sort_exec, task_ctx) =
+            shared_dictionary_sort(shared_dictionary_batch(10_000)?, 1_000, 4)?;
+        let mut stream = sort_exec.execute(0, Arc::clone(&task_ctx))?;
+
+        drop(stream.next().await.unwrap()?);
+        assert!(task_ctx.memory_pool().reserved() > 0);
+
+        drop(stream);
         assert_eq!(task_ctx.memory_pool().reserved(), 0);
         Ok(())
     }
