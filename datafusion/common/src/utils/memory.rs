@@ -137,7 +137,16 @@ pub fn get_record_batch_memory_size(batch: &RecordBatch) -> usize {
 /// Calculate total used memory of `batches`, counting a `Buffer` shared by
 /// several batches only once.
 pub fn get_record_batches_memory_size(batches: &[RecordBatch]) -> usize {
-    get_record_batches_release_sizes(batches).into_iter().sum()
+    // Store pointers to `Buffer`'s start memory address (instead of actual
+    // used data region's pointer represented by current `Array`)
+    let mut counted_buffers: HashSet<NonNull<u8>> = HashSet::new();
+    let mut total_size = 0;
+
+    for batch in batches {
+        count_record_batch_memory_size(batch, &mut counted_buffers, &mut total_size);
+    }
+
+    total_size
 }
 
 /// Memory each of `batches` releases when consumed in order: a `Buffer`
@@ -147,13 +156,21 @@ pub fn get_record_batches_release_sizes(batches: &[RecordBatch]) -> Vec<usize> {
     let mut sizes = vec![0; batches.len()];
 
     for (size, batch) in sizes.iter_mut().zip(batches).rev() {
-        for array in batch.columns() {
-            let array_data = array.to_data();
-            count_array_data_memory_size(&array_data, &mut counted_buffers, size);
-        }
+        count_record_batch_memory_size(batch, &mut counted_buffers, size);
     }
 
     sizes
+}
+
+fn count_record_batch_memory_size(
+    batch: &RecordBatch,
+    counted_buffers: &mut HashSet<NonNull<u8>>,
+    total_size: &mut usize,
+) {
+    for array in batch.columns() {
+        let array_data = array.to_data();
+        count_array_data_memory_size(&array_data, counted_buffers, total_size);
+    }
 }
 
 /// Count the memory usage of `array_data` and its children recursively.
