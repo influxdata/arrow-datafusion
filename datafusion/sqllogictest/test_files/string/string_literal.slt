@@ -132,10 +132,10 @@ SELECT substr('Hello🌏世界', 5, 3)
 ----
 o🌏世
 
-statement error Function 'substr' failed to match any signature
+statement error DataFusion error: Error during planning: Function 'substr' requires TypeSignatureClass::Native\(LogicalType\(Native\(String\), String\)\), but received Int64 \(DataType: Int64\)
 SELECT substr(1, 3)
 
-statement error Function 'substr' failed to match any signature
+statement error DataFusion error: Error during planning: Function 'substr' requires TypeSignatureClass::Native\(LogicalType\(Native\(String\), String\)\), but received Int64 \(DataType: Int64\)
 SELECT substr(1, 3, 4)
 
 statement error Execution error: negative substring length not allowed

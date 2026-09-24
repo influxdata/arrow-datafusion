@@ -16,20 +16,22 @@
 // under the License.
 
 use super::binary::binary_numeric_coercion;
-use crate::{AggregateUDF, ScalarUDF, Signature, TypeSignature, WindowUDF};
+use crate::{
+    AggregateUDF, ScalarUDF, Signature, TypeSignature, TypeSignatureClass, WindowUDF,
+};
 use arrow::datatypes::{Field, FieldRef};
 use arrow::{
     compute::can_cast_types,
     datatypes::{DataType, TimeUnit},
 };
-use datafusion_common::types::LogicalType;
+use datafusion_common::types::{LogicalType, NativeType, logical_string};
 use datafusion_common::utils::{
     ListCoercion, base_type, coerced_fixed_size_list_to_list,
 };
 use datafusion_common::{
-    Result, exec_err, internal_err, plan_err, types::NativeType, utils::list_ndims,
+    DataFusionError, Result, internal_err, plan_err, utils::list_ndims,
 };
-use datafusion_expr_common::signature::ArrayFunctionArgument;
+use datafusion_expr_common::signature::{Arity, ArrayFunctionArgument, Coercion};
 use datafusion_expr_common::type_coercion::binary::type_union_resolution;
 use datafusion_expr_common::{
     signature::{ArrayFunctionSignature, FIXED_SIZE_LIST_WILDCARD, TIMEZONE_WILDCARD},
@@ -37,6 +39,7 @@ use datafusion_expr_common::{
     type_coercion::binary::string_coercion,
 };
 use itertools::Itertools as _;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Extension trait to unify common functionality between [`ScalarUDF`], [`AggregateUDF`]
@@ -50,6 +53,15 @@ pub trait UDFCoercionExt {
     /// Should delegate to [`ScalarUDF::coerce_types`], [`AggregateUDF::coerce_types`]
     /// or [`WindowUDF::coerce_types`].
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>>;
+
+    /// Return a function-specific signature failure when generic `OneOf`
+    /// diagnostics are not descriptive enough.
+    fn diagnose_failed_signature(
+        &self,
+        _arg_types: &[DataType],
+    ) -> Option<DataFusionError> {
+        None
+    }
 }
 
 impl UDFCoercionExt for ScalarUDF {
@@ -77,6 +89,13 @@ impl UDFCoercionExt for AggregateUDF {
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.coerce_types(arg_types)
+    }
+
+    fn diagnose_failed_signature(
+        &self,
+        arg_types: &[DataType],
+    ) -> Option<DataFusionError> {
+        self.diagnose_failed_signature(arg_types)
     }
 }
 
@@ -307,51 +326,305 @@ fn try_coerce_types(
     )
 }
 
+#[derive(Debug)]
+struct PlanFailure {
+    err: DataFusionError,
+    matches_arity: bool,
+    has_hint: bool,
+    detail: Option<TypeMismatchDetail>,
+}
+
+#[derive(Debug)]
+enum SignatureFailure {
+    Plan(PlanFailure),
+    NonPlan(DataFusionError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypeMismatchDetail {
+    arg_index: usize,
+    required_type: String,
+    received_type: String,
+    data_type: String,
+}
+
+fn signature_matches_arity(signature: &TypeSignature, actual: usize) -> bool {
+    match signature.arity() {
+        Arity::Fixed(expected) => expected == actual,
+        Arity::Variable => true,
+    }
+}
+
+fn collect_fixed_arities(signature: &TypeSignature, arities: &mut BTreeSet<usize>) {
+    match signature {
+        TypeSignature::OneOf(signatures) => {
+            for signature in signatures {
+                collect_fixed_arities(signature, arities);
+            }
+        }
+        _ => {
+            if let Arity::Fixed(expected) = signature.arity() {
+                arities.insert(expected);
+            }
+        }
+    }
+}
+
+fn build_one_of_arity_error(
+    function_name: &str,
+    actual: usize,
+    expected_arities: &[usize],
+) -> Option<DataFusionError> {
+    if expected_arities.is_empty() {
+        return None;
+    }
+
+    let expected = expected_arities.to_vec();
+    let message = if expected.len() == 1 {
+        format!(
+            "Function '{function_name}' expects {} arguments but received {actual}",
+            expected[0]
+        )
+    } else if expected.windows(2).all(|window| window[1] == window[0] + 1) {
+        format!(
+            "Function '{function_name}' expects {} to {} arguments but received {actual}",
+            expected.first().unwrap(),
+            expected.last().unwrap()
+        )
+    } else {
+        format!(
+            "Function '{function_name}' expects one of {} arguments but received {actual}",
+            expected.iter().join(", ")
+        )
+    };
+
+    Some(DataFusionError::Plan(message))
+}
+
+fn combine_type_mismatch_failures(
+    function_name: &str,
+    failures: &[PlanFailure],
+) -> Option<DataFusionError> {
+    let details = failures
+        .iter()
+        .map(|failure| failure.detail.as_ref())
+        .collect::<Option<Vec<_>>>()?;
+
+    let first = details.first()?;
+    if !details.iter().all(|detail| {
+        detail.arg_index == first.arg_index
+            && detail.received_type == first.received_type
+            && detail.data_type == first.data_type
+    }) {
+        return None;
+    }
+
+    let required_types = details
+        .iter()
+        .map(|detail| detail.required_type.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if required_types.is_empty() {
+        return None;
+    }
+
+    let required = if required_types.len() == 1 {
+        required_types[0].to_string()
+    } else {
+        format!("one of {}", required_types.join(", "))
+    };
+
+    Some(DataFusionError::Plan(format!(
+        "Function '{function_name}' requires {required}, but received {} (DataType: {}).",
+        first.received_type, first.data_type
+    )))
+}
+
+fn select_best_plan_failure(
+    function_name: &str,
+    failures: Vec<PlanFailure>,
+) -> Option<DataFusionError> {
+    let matching_failures = failures
+        .into_iter()
+        .filter(|failure| failure.matches_arity)
+        .collect::<Vec<_>>();
+
+    if matching_failures.is_empty() {
+        return None;
+    }
+
+    if matching_failures.len() == 1 {
+        return Some(matching_failures.into_iter().next().unwrap().err);
+    }
+
+    let hinted = matching_failures
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, failure)| failure.has_hint.then_some(idx))
+        .collect::<Vec<_>>();
+    if hinted.len() == 1 {
+        return Some(matching_failures.into_iter().nth(hinted[0]).unwrap().err);
+    }
+
+    let messages = matching_failures
+        .iter()
+        .map(|failure| failure.err.strip_backtrace().to_string())
+        .collect::<Vec<_>>();
+    if messages.windows(2).all(|pair| pair[0] == pair[1]) {
+        return Some(matching_failures.into_iter().next().unwrap().err);
+    }
+
+    combine_type_mismatch_failures(function_name, &matching_failures)
+}
+
+fn coercible_mismatch_detail(
+    coercions: &[Coercion],
+    current_types: &[DataType],
+) -> Option<TypeMismatchDetail> {
+    if coercions.len() != current_types.len() {
+        return None;
+    }
+
+    for (arg_index, (param, current_type)) in
+        coercions.iter().zip(current_types.iter()).enumerate()
+    {
+        let current_native_type = NativeType::from(current_type);
+        let desired_type = param.desired_type();
+        let desired_matches = desired_type.matches_native_type(&current_native_type);
+        let allowed_matches = param
+            .allowed_source_types()
+            .iter()
+            .any(|source_type| source_type.matches_native_type(&current_native_type));
+
+        if !desired_matches && !allowed_matches {
+            return Some(TypeMismatchDetail {
+                arg_index,
+                required_type: desired_type.to_string(),
+                received_type: current_native_type.to_string(),
+                data_type: current_type.to_string(),
+            });
+        }
+    }
+
+    None
+}
+
+fn to_signature_failure(
+    signature: &TypeSignature,
+    current_types: &[DataType],
+    err: DataFusionError,
+) -> Box<SignatureFailure> {
+    match err {
+        DataFusionError::Plan(message) => Box::new(SignatureFailure::Plan(PlanFailure {
+            matches_arity: signature_matches_arity(signature, current_types.len()),
+            has_hint: message.contains("Hint:"),
+            detail: match signature {
+                TypeSignature::Coercible(coercions) => {
+                    coercible_mismatch_detail(coercions, current_types)
+                }
+                _ => None,
+            },
+            err: DataFusionError::Plan(message),
+        })),
+        err => Box::new(SignatureFailure::NonPlan(err)),
+    }
+}
+
+fn evaluate_one_of_with_udf<F: UDFCoercionExt>(
+    signatures: &[TypeSignature],
+    current_types: &[DataType],
+    func: &F,
+) -> Result<Vec<Vec<DataType>>> {
+    let actual = current_types.len();
+    let mut valid_types = vec![];
+    let mut plan_failures = vec![];
+    let mut deferred_non_plan = None;
+    let mut fixed_arities = BTreeSet::new();
+
+    for signature in signatures {
+        collect_fixed_arities(signature, &mut fixed_arities);
+
+        match evaluate_signature_with_udf(signature, current_types, func) {
+            Ok(types) => valid_types.extend(types),
+            Err(failure) => match *failure {
+                SignatureFailure::Plan(failure) => plan_failures.push(failure),
+                SignatureFailure::NonPlan(err) => {
+                    if deferred_non_plan.is_none() {
+                        deferred_non_plan = Some(err);
+                    }
+                }
+            },
+        }
+    }
+
+    if !valid_types.is_empty() {
+        return Ok(valid_types);
+    }
+
+    if let Some(err) = func.diagnose_failed_signature(current_types) {
+        return Err(err);
+    }
+
+    if let Some(err) = select_best_plan_failure(func.name(), plan_failures) {
+        return Err(err);
+    }
+
+    let matching_arity_exists = signatures
+        .iter()
+        .any(|signature| signature_matches_arity(signature, actual));
+    let expected_arities = fixed_arities.iter().copied().collect::<Vec<_>>();
+    if !matching_arity_exists
+        && let Some(err) =
+            build_one_of_arity_error(func.name(), actual, &expected_arities)
+    {
+        return Err(err);
+    }
+
+    if let Some(err) = deferred_non_plan {
+        return Err(err);
+    }
+
+    plan_err!("Function '{}' failed to match any signature", func.name())
+}
+
+fn evaluate_signature_with_udf<F: UDFCoercionExt>(
+    signature: &TypeSignature,
+    current_types: &[DataType],
+    func: &F,
+) -> std::result::Result<Vec<Vec<DataType>>, Box<SignatureFailure>> {
+    match signature {
+        TypeSignature::UserDefined => match func.coerce_types(current_types) {
+            Ok(coerced_types) => Ok(vec![coerced_types]),
+            Err(e) => Err(Box::new(SignatureFailure::NonPlan(
+                DataFusionError::Execution(format!(
+                    "Function '{}' user-defined coercion failed with: {}",
+                    func.name(),
+                    e.strip_backtrace()
+                )),
+            ))),
+        },
+        TypeSignature::OneOf(signatures) => {
+            evaluate_one_of_with_udf(signatures, current_types, func)
+                .map_err(|err| to_signature_failure(signature, current_types, err))
+        }
+        _ => get_valid_types(func.name(), signature, current_types)
+            .map_err(|err| to_signature_failure(signature, current_types, err)),
+    }
+}
+
 fn get_valid_types_with_udf<F: UDFCoercionExt>(
     signature: &TypeSignature,
     current_types: &[DataType],
     func: &F,
 ) -> Result<Vec<Vec<DataType>>> {
-    let valid_types = match signature {
-        TypeSignature::UserDefined => match func.coerce_types(current_types) {
-            Ok(coerced_types) => vec![coerced_types],
-            Err(e) => {
-                return exec_err!(
-                    "Function '{}' user-defined coercion failed with {:?}",
-                    func.name(),
-                    e.strip_backtrace()
-                );
-            }
-        },
-        TypeSignature::OneOf(signatures) => {
-            let mut res = vec![];
-            let mut errors = vec![];
-            for sig in signatures {
-                match get_valid_types_with_udf(sig, current_types, func) {
-                    Ok(valid_types) => {
-                        res.extend(valid_types);
-                    }
-                    Err(e) => {
-                        errors.push(e.to_string());
-                    }
-                }
-            }
-
-            // Every signature failed, return the joined error
-            if res.is_empty() {
-                return internal_err!(
-                    "Function '{}' failed to match any signature, errors: {}",
-                    func.name(),
-                    errors.join(",")
-                );
-            } else {
-                res
-            }
+    evaluate_signature_with_udf(signature, current_types, func).map_err(|failure| {
+        match *failure {
+            SignatureFailure::Plan(failure) => failure.err,
+            SignatureFailure::NonPlan(err) => err,
         }
-        _ => get_valid_types(func.name(), signature, current_types)?,
-    };
-
-    Ok(valid_types)
+    })
 }
 
 /// Returns a Vec of all possible valid argument types for the given signature.
@@ -635,8 +908,16 @@ fn get_valid_types(
                         default_casted_type.default_cast_for(current_type)?;
                     new_types.push(casted_type);
                 } else {
-                    return internal_err!(
-                        "Expect {} but received NativeType::{}, DataType: {}",
+                    let hint = if matches!(current_native_type, NativeType::Binary)
+                        && param.desired_type()
+                            == &TypeSignatureClass::Native(logical_string())
+                    {
+                        "\n\nHint: Binary types are not automatically coerced to String. Use CAST(column AS VARCHAR) to convert Binary data to String."
+                    } else {
+                        ""
+                    };
+                    return plan_err!(
+                        "Function '{function_name}' requires {}, but received {} (DataType: {}).{hint}",
                         param.desired_type(),
                         current_native_type,
                         current_type
@@ -928,7 +1209,7 @@ mod tests {
 
     use super::*;
     use arrow::datatypes::Field;
-    use datafusion_common::{assert_contains, types::logical_binary};
+    use datafusion_common::{assert_contains, exec_err, types::logical_binary};
     use datafusion_expr_common::signature::{Coercion, TypeSignatureClass};
 
     #[test]
@@ -1116,6 +1397,233 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    struct MockUdf(Signature);
+
+    impl UDFCoercionExt for MockUdf {
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn signature(&self) -> &Signature {
+            &self.0
+        }
+        fn coerce_types(&self, _arg_types: &[DataType]) -> Result<Vec<DataType>> {
+            unimplemented!()
+        }
+    }
+
+    struct AlwaysExecErrUdf(Signature);
+
+    impl UDFCoercionExt for AlwaysExecErrUdf {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.0
+        }
+
+        fn coerce_types(&self, _arg_types: &[DataType]) -> Result<Vec<DataType>> {
+            exec_err!("boom")
+        }
+    }
+
+    struct DiagnoseErrUdf(Signature);
+
+    impl UDFCoercionExt for DiagnoseErrUdf {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.0
+        }
+
+        fn coerce_types(&self, _arg_types: &[DataType]) -> Result<Vec<DataType>> {
+            unimplemented!()
+        }
+
+        fn diagnose_failed_signature(
+            &self,
+            _arg_types: &[DataType],
+        ) -> Option<DataFusionError> {
+            Some(DataFusionError::Plan(
+                "test semantic signature failure".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn test_one_of_drops_internal_error_and_combines_type_errors() {
+        let current_fields = vec![Arc::new(Field::new("t", DataType::Boolean, true))];
+        let signature = Signature::one_of(
+            vec![
+                TypeSignature::Coercible(vec![Coercion::new_exact(
+                    TypeSignatureClass::Decimal,
+                )]),
+                TypeSignature::Coercible(vec![Coercion::new_exact(
+                    TypeSignatureClass::Duration,
+                )]),
+            ],
+            Volatility::Immutable,
+        );
+
+        let err = fields_with_udf(&current_fields, &MockUdf(signature)).unwrap_err();
+        assert!(matches!(err, DataFusionError::Plan(_)));
+        let err = err.to_string();
+
+        assert_eq!(
+            err,
+            "Error during planning: Function 'test' requires one of TypeSignatureClass::Decimal, TypeSignatureClass::Duration, but received Boolean (DataType: Boolean)."
+        );
+        assert!(!err.contains("Internal error"));
+    }
+
+    #[test]
+    fn test_one_of_restores_arity_error() {
+        let current_fields = vec![Arc::new(Field::new("t", DataType::Int32, true))];
+        let signature = Signature::one_of(
+            vec![TypeSignature::Any(2), TypeSignature::Any(3)],
+            Volatility::Immutable,
+        );
+
+        let err = fields_with_udf(&current_fields, &MockUdf(signature)).unwrap_err();
+        assert!(matches!(err, DataFusionError::Plan(_)));
+        assert_eq!(
+            err.to_string(),
+            "Error during planning: Function 'test' expects 2 to 3 arguments but received 1"
+        );
+    }
+
+    #[test]
+    fn test_one_of_uses_specific_error_for_unique_matching_signature() {
+        let current_fields = vec![Arc::new(Field::new("t", DataType::Int64, true))];
+        let signature = Signature::one_of(
+            vec![
+                TypeSignature::Any(3),
+                TypeSignature::Coercible(vec![Coercion::new_exact(
+                    TypeSignatureClass::Native(logical_string()),
+                )]),
+            ],
+            Volatility::Immutable,
+        );
+
+        let err = fields_with_udf(&current_fields, &MockUdf(signature)).unwrap_err();
+        assert!(matches!(err, DataFusionError::Plan(_)));
+        assert!(
+            err.to_string().starts_with(
+                "Error during planning: Function 'test' requires TypeSignatureClass::Native(LogicalType(Native(String), String)), but received Int64 (DataType: Int64)."
+            ),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_one_of_prefers_hinted_matching_signature() {
+        let current_fields = vec![Arc::new(Field::new("t", DataType::Binary, true))];
+        let signature = Signature::one_of(
+            vec![
+                TypeSignature::Coercible(vec![Coercion::new_exact(
+                    TypeSignatureClass::Decimal,
+                )]),
+                TypeSignature::Coercible(vec![Coercion::new_exact(
+                    TypeSignatureClass::Native(logical_string()),
+                )]),
+            ],
+            Volatility::Immutable,
+        );
+
+        let err = fields_with_udf(&current_fields, &MockUdf(signature)).unwrap_err();
+        assert!(matches!(err, DataFusionError::Plan(_)));
+        let err = err.to_string();
+
+        assert!(err.contains(
+            "Function 'test' requires TypeSignatureClass::Native(LogicalType(Native(String), String)), but received Binary"
+        ));
+        assert!(
+            err.contains("Hint: Binary types are not automatically coerced to String.")
+        );
+    }
+
+    #[test]
+    fn test_one_of_combines_same_arity_type_mismatches() {
+        let current_fields = vec![Arc::new(Field::new("t", DataType::Utf8, true))];
+        let signature = Signature::one_of(
+            vec![
+                TypeSignature::Coercible(vec![Coercion::new_exact(
+                    TypeSignatureClass::Decimal,
+                )]),
+                TypeSignature::Coercible(vec![Coercion::new_exact(
+                    TypeSignatureClass::Float,
+                )]),
+            ],
+            Volatility::Immutable,
+        );
+
+        let err = fields_with_udf(&current_fields, &MockUdf(signature)).unwrap_err();
+        assert!(matches!(err, DataFusionError::Plan(_)));
+        assert_eq!(
+            err.to_string(),
+            "Error during planning: Function 'test' requires one of TypeSignatureClass::Decimal, TypeSignatureClass::Float, but received String (DataType: Utf8)."
+        );
+    }
+
+    #[test]
+    fn test_one_of_propagates_non_plan_errors_when_no_plan_error_exists() {
+        let current_fields = vec![Arc::new(Field::new("t", DataType::Int32, true))];
+        let signature =
+            Signature::one_of(vec![TypeSignature::UserDefined], Volatility::Immutable);
+
+        let err =
+            fields_with_udf(&current_fields, &AlwaysExecErrUdf(signature)).unwrap_err();
+        assert!(matches!(err, DataFusionError::Execution(_)));
+        assert!(err.to_string().starts_with(
+            "Execution error: Function 'test' user-defined coercion failed with: Execution error: boom"
+        ));
+    }
+
+    #[test]
+    fn test_one_of_keeps_success_when_later_user_defined_branch_fails() -> Result<()> {
+        let current_fields = vec![Arc::new(Field::new("t", DataType::Int32, true))];
+        let signature = Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Int32]),
+                TypeSignature::UserDefined,
+            ],
+            Volatility::Immutable,
+        );
+
+        let fields = fields_with_udf(&current_fields, &AlwaysExecErrUdf(signature))?;
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].data_type(), &DataType::Int32);
+        Ok(())
+    }
+
+    #[test]
+    fn test_one_of_allows_function_specific_diagnostic_override() {
+        let current_fields = vec![Arc::new(Field::new("t", DataType::Boolean, true))];
+        let signature = Signature::one_of(
+            vec![
+                TypeSignature::Coercible(vec![Coercion::new_exact(
+                    TypeSignatureClass::Decimal,
+                )]),
+                TypeSignature::Coercible(vec![Coercion::new_exact(
+                    TypeSignatureClass::Duration,
+                )]),
+            ],
+            Volatility::Immutable,
+        );
+
+        let err =
+            fields_with_udf(&current_fields, &DiagnoseErrUdf(signature)).unwrap_err();
+        assert!(matches!(err, DataFusionError::Plan(_)));
+        assert_eq!(
+            err.to_string(),
+            "Error during planning: test semantic signature failure"
+        );
     }
 
     #[test]
