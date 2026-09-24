@@ -42,7 +42,6 @@ use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
 use crate::stream::RecordBatchStreamAdapter;
-use crate::stream::ReservationStream;
 use crate::topk::TopK;
 use crate::topk::TopKDynamicFilters;
 use crate::{
@@ -50,7 +49,7 @@ use crate::{
     ExecutionPlanProperties, Partitioning, PlanProperties, SendableRecordBatchStream,
     Statistics,
 };
-use datafusion_common::utils::memory::get_record_batches_memory_size;
+use datafusion_common::utils::memory::get_record_batches_release_sizes;
 
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, StringViewArray};
 use arrow::compute::{concat_batches, lexsort_to_indices, take_arrays};
@@ -733,19 +732,20 @@ impl ExternalSorter {
             // Using try_resize avoids a release-then-reacquire cycle, which
             // matters for MemoryPool implementations where grow/shrink have
             // non-trivial cost (e.g. JNI calls in Comet).
-            let total_sorted_size = get_record_batches_memory_size(&sorted_batches);
+            let release_sizes = get_record_batches_release_sizes(&sorted_batches);
             reservation
-                .try_resize(total_sorted_size)
+                .try_resize(release_sizes.iter().sum())
                 .map_err(Self::err_with_oom_context)?;
 
-            // Wrap in ReservationStream to hold the reservation
-            Result::<_, DataFusionError>::Ok(Box::pin(ReservationStream::new(
-                Arc::clone(&schema),
-                Box::pin(RecordBatchStreamAdapter::new(
-                    schema,
-                    futures::stream::iter(sorted_batches.into_iter().map(Ok)),
-                )),
-                reservation,
+            let batches = sorted_batches.into_iter().zip(release_sizes).map(
+                move |(batch, size)| {
+                    reservation.shrink(size);
+                    Ok(batch)
+                },
+            );
+            Result::<_, DataFusionError>::Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(batches),
             )) as SendableRecordBatchStream)
         })
         .try_flatten()
@@ -1454,6 +1454,7 @@ mod tests {
     use datafusion_common::cast::as_primitive_array;
     use datafusion_common::config::ConfigOptions;
     use datafusion_common::test_util::batches_to_string;
+    use datafusion_common::utils::memory::get_record_batches_memory_size;
     use datafusion_common::{DataFusionError, Result, ScalarValue};
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
@@ -1799,6 +1800,69 @@ mod tests {
         let rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, ROWS);
         assert_eq!(result.len(), ROWS.div_ceil(BATCH_SIZE));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sort_shared_dictionary_release_per_batch() -> Result<()> {
+        const ROWS: usize = 10_000;
+        const BATCH_SIZE: usize = 1_000;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("time", DataType::Int64, false),
+        ]));
+        let mut tag = StringDictionaryBuilder::<Int32Type>::new();
+        for i in 0..ROWS {
+            tag.append_value(format!("truck_{:05}", (i * 7919) % ROWS));
+        }
+        let time = Int64Array::from_iter_values((0..ROWS).rev().map(|i| i as i64));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(tag.finish()), Arc::new(time)],
+        )?;
+
+        let expressions: LexOrdering = [
+            PhysicalSortExpr::new_default(col("tag", &schema)?),
+            PhysicalSortExpr::new_default(col("time", &schema)?),
+        ]
+        .into();
+        let expected = sort_batch_chunked(&batch, &expressions, BATCH_SIZE)?;
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(get_record_batch_memory_size(&batch) * 4, 1.0)
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+            )
+            .build_arc()?;
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(BATCH_SIZE))
+                .with_runtime(runtime),
+        );
+
+        let plan =
+            TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let sort_exec = SortExec::new(expressions, plan);
+        let mut stream = sort_exec.execute(0, Arc::clone(&task_ctx))?;
+
+        // Emitted batches are dropped right away; the pool must still hold
+        // what the queued batches reference, shared dictionary included.
+        for emitted in 1..=expected.len() {
+            drop(stream.next().await.unwrap()?);
+            assert_eq!(
+                task_ctx.memory_pool().reserved(),
+                get_record_batches_memory_size(&expected[emitted..]),
+                "after {emitted} of {} batches",
+                expected.len()
+            );
+        }
+        assert!(stream.next().await.is_none());
+        assert_eq!(task_ctx.memory_pool().reserved(), 0);
         Ok(())
     }
 
