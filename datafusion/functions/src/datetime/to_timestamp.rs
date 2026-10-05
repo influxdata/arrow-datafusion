@@ -377,7 +377,9 @@ impl ScalarUDFImpl for ToTimestampFunc {
                     let f16_arr = downcast_arg!(arr, Float16Array);
                     let result: TimestampNanosecondArray =
                         f16_arr.unary(|x| (x.to_f64() * 1_000_000_000.0) as i64);
-                    Ok(ColumnarValue::Array(Arc::new(result.with_timezone_opt(None::<Arc<str>>))))
+                    Ok(ColumnarValue::Array(Arc::new(
+                        result.with_timezone_opt(None::<Arc<str>>),
+                    )))
                 }
                 _ => exec_err!("Invalid Float16 value for to_timestamp"),
             },
@@ -394,7 +396,9 @@ impl ScalarUDFImpl for ToTimestampFunc {
                     let f32_arr = downcast_arg!(arr, Float32Array);
                     let result: TimestampNanosecondArray =
                         f32_arr.unary(|x| (x as f64 * 1_000_000_000.0) as i64);
-                    Ok(ColumnarValue::Array(Arc::new(result.with_timezone_opt(None::<Arc<str>>))))
+                    Ok(ColumnarValue::Array(Arc::new(
+                        result.with_timezone_opt(None::<Arc<str>>),
+                    )))
                 }
                 _ => exec_err!("Invalid Float32 value for to_timestamp"),
             },
@@ -410,7 +414,9 @@ impl ScalarUDFImpl for ToTimestampFunc {
                     let f64_arr = downcast_arg!(arr, Float64Array);
                     let result: TimestampNanosecondArray =
                         f64_arr.unary(|x| (x * 1_000_000_000.0) as i64);
-                    Ok(ColumnarValue::Array(Arc::new(result.with_timezone_opt(None::<Arc<str>>))))
+                    Ok(ColumnarValue::Array(Arc::new(
+                        result.with_timezone_opt(None::<Arc<str>>),
+                    )))
                 }
                 _ => exec_err!("Invalid Float64 value for to_timestamp"),
             },
@@ -548,9 +554,7 @@ impl ScalarUDFImpl for ToTimestampMillisFunc {
             | Decimal64(_, _)
             | Decimal128(_, _)
             | Decimal256(_, _) => args[0].cast_to(&Timestamp(Millisecond, None), None),
-            Timestamp(_, tz) => {
-                args[0].cast_to(&Timestamp(Millisecond, tz), None)
-            }
+            Timestamp(_, tz) => args[0].cast_to(&Timestamp(Millisecond, tz), None),
             Float16 | Float32 | Float64 => args[0]
                 .cast_to(&Int64, None)?
                 .cast_to(&Timestamp(Millisecond, None), None),
@@ -619,9 +623,7 @@ impl ScalarUDFImpl for ToTimestampMicrosFunc {
             | Decimal64(_, _)
             | Decimal128(_, _)
             | Decimal256(_, _) => args[0].cast_to(&Timestamp(Microsecond, None), None),
-            Timestamp(_, tz) => {
-                args[0].cast_to(&Timestamp(Microsecond, tz), None)
-            }
+            Timestamp(_, tz) => args[0].cast_to(&Timestamp(Microsecond, tz), None),
             Float16 | Float32 | Float64 => args[0]
                 .cast_to(&Int64, None)?
                 .cast_to(&Timestamp(Microsecond, None), None),
