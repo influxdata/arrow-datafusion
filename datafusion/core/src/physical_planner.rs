@@ -970,10 +970,17 @@ impl DefaultPhysicalPlanner {
                             ));
                         }
                     }
-                    return internal_err!(
+                    debug!(
                         "Physical input schema should be the same as the one converted from logical input schema. Differences: {}",
                         differences.iter().map(|s| format!("\n\t- {s}")).join("")
                     );
+
+                    //influx: temporarily remove error and only log so that we can find a
+                    //reproducer in production
+                    // return internal_err!("Physical input schema should be the same as the one converted from logical input schema. Differences: {}", differences
+                    //     .iter()
+                    //     .map(|s| format!("\n\t- {s}"))
+                    //     .join(""));
                 }
 
                 let groups = self.create_grouping_physical_expr(
@@ -4501,6 +4508,8 @@ digraph {
     }
 
     #[tokio::test]
+    // Ignored due to disabling the physical schema check skip.
+    #[ignore]
     async fn test_aggregate_schema_mismatch_metadata() {
         let logical_schema =
             Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
@@ -4521,6 +4530,8 @@ digraph {
     }
 
     #[tokio::test]
+    // Ignored due to disabling the physical schema check skip.
+    #[ignore]
     async fn test_aggregate_schema_mismatch_field_count() {
         let logical_schema =
             Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
@@ -4541,6 +4552,8 @@ digraph {
     }
 
     #[tokio::test]
+    // Ignored due to disabling the physical schema check skip.
+    #[ignore]
     async fn test_aggregate_schema_mismatch_field_name() {
         let logical_schema =
             Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
@@ -4562,6 +4575,8 @@ digraph {
     }
 
     #[tokio::test]
+    // Ignored due to disabling the physical schema check skip.
+    #[ignore]
     async fn test_aggregate_schema_mismatch_field_type() {
         let logical_schema =
             Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
@@ -4580,6 +4595,8 @@ digraph {
     }
 
     #[tokio::test]
+    // Ignored due to disabling the physical schema check skip.
+    #[ignore]
     async fn test_aggregate_schema_mismatch_field_nullability() {
         let logical_schema =
             Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
@@ -4598,6 +4615,8 @@ digraph {
     }
 
     #[tokio::test]
+    // Ignored due to disabling the physical schema check skip.
+    #[ignore]
     async fn test_aggregate_schema_mismatch_field_metadata() {
         let logical_schema =
             Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
@@ -4618,6 +4637,8 @@ digraph {
     }
 
     #[tokio::test]
+    // Ignored due to disabling the physical schema check skip.
+    #[ignore]
     async fn test_aggregate_schema_mismatch_multiple() {
         let logical_schema = Arc::new(Schema::new(vec![
             Field::new("c1", DataType::Int32, false),
