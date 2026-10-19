@@ -7860,3 +7860,66 @@ async fn left_join_with_partial_filter_preserves_streamed_order() -> Result<()> 
     );
     Ok(())
 }
+
+fn build_timestamp_table(
+    name: &str,
+    tz: Option<&str>,
+    batches: &[&[i64]],
+) -> Arc<dyn ExecutionPlan> {
+    use arrow::array::TimestampNanosecondArray;
+    use arrow::datatypes::TimeUnit;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        name,
+        DataType::Timestamp(TimeUnit::Nanosecond, tz.map(Into::into)),
+        false,
+    )]));
+    let batches = batches
+        .iter()
+        .map(|values| {
+            let array = TimestampNanosecondArray::from(values.to_vec())
+                .with_timezone_opt(tz.map(String::from));
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)]).unwrap()
+        })
+        .collect();
+    build_table_from_batches(batches)
+}
+
+/// Joining on a timezone-aware timestamp must give the same rows as the
+/// same keys without a timezone. Key groups cross batch boundaries.
+#[tokio::test]
+async fn join_timestamp_with_timezone_matches_naive() -> Result<()> {
+    let mut failures = vec![];
+    for join_type in [
+        Inner, Left, Right, Full, LeftSemi, LeftAnti, RightSemi, RightAnti,
+    ] {
+        let mut outcomes = vec![];
+        for tz in [None, Some("UTC")] {
+            let left = build_timestamp_table("t1", tz, &[&[1, 2, 2], &[2, 3, 5]]);
+            let right = build_timestamp_table("t2", tz, &[&[2, 2], &[2, 4, 5]]);
+            let on = vec![(
+                Arc::new(Column::new_with_schema("t1", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("t2", &right.schema())?) as _,
+            )];
+            let outcome = match join_collect_batch_size_equals_two(
+                left, right, on, join_type,
+            )
+            .await
+            {
+                Ok((_, batches)) => {
+                    Ok(batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            outcomes.push(outcome);
+        }
+        if outcomes[0].is_ok() && outcomes[0] != outcomes[1] {
+            failures.push(format!(
+                "{join_type}: naive={:?} utc={:?}",
+                outcomes[0], outcomes[1]
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
