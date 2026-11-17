@@ -47,7 +47,6 @@ use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
 use crate::statistics::{ChildStats, StatisticsArgs};
-use crate::stream::ReservationStream;
 use crate::stream::{ObservedStream, RecordBatchStreamAdapter};
 use crate::topk::TopK;
 use crate::topk::TopKDynamicFilters;
@@ -62,6 +61,7 @@ use arrow::compute::{concat_batches, lexsort_to_indices, take_arrays};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::SpillCompression;
 use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::utils::memory::RecordBatchMemoryCounter;
 use datafusion_common::{
     DataFusionError, Result, assert_or_internal_err, internal_datafusion_err,
     unwrap_or_internal_err,
@@ -754,22 +754,29 @@ impl ExternalSorter {
             // Using try_resize avoids a release-then-reacquire cycle, which
             // matters for MemoryPool implementations where grow/shrink have
             // non-trivial cost (e.g. JNI calls in Comet).
-            let total_sorted_size: usize = sorted_batches
+            // Chunks share buffers (e.g. dictionary values after `take`), so
+            // count each buffer once and release it with the last chunk that
+            // references it.
+            let mut counter = RecordBatchMemoryCounter::new();
+            let mut release_sizes: Vec<usize> = sorted_batches
                 .iter()
-                .map(get_record_batch_memory_size)
-                .sum();
+                .rev()
+                .map(|batch| counter.count_batch(batch))
+                .collect();
+            release_sizes.reverse();
             reservation
-                .try_resize(total_sorted_size)
+                .try_resize(counter.memory_usage())
                 .map_err(Self::err_with_oom_context)?;
 
-            // Wrap in ReservationStream to hold the reservation
-            Result::<_, DataFusionError>::Ok(Box::pin(ReservationStream::new(
-                Arc::clone(&schema),
-                Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::clone(&schema),
-                    futures::stream::iter(sorted_batches.into_iter().map(Ok)),
-                )),
-                reservation,
+            let batches = sorted_batches.into_iter().zip(release_sizes).map(
+                move |(batch, size)| {
+                    reservation.shrink(size);
+                    Ok(batch)
+                },
+            );
+            Result::<_, DataFusionError>::Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(batches),
             )) as SendableRecordBatchStream)
         })
         .try_flatten();
@@ -1740,6 +1747,7 @@ mod tests {
     use datafusion_common::test_util::batches_to_string;
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
     use datafusion_execution::memory_pool::{
         GreedyMemoryPool, MemoryConsumer, MemoryPool,
     };
@@ -2152,6 +2160,120 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// One batch whose `tag` dictionary is shared by every chunk of its sorted
+    /// output.
+    fn shared_dictionary_batch(rows: usize) -> Result<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("time", DataType::Int64, false),
+        ]));
+        let mut tag = StringDictionaryBuilder::<Int32Type>::new();
+        for i in 0..rows {
+            tag.append_value(format!("truck_{:05}", (i * 7919) % (rows / 2)));
+        }
+        let time = Int64Array::from_iter_values((0..rows).rev().map(|i| i as i64));
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![Arc::new(tag.finish()), Arc::new(time)],
+        )?)
+    }
+
+    /// `SortExec` on `batch` by `(tag, time)` with a `batch_size`-row output,
+    /// a pool of `pool_batches` times the input and no disk manager.
+    fn shared_dictionary_sort(
+        batch: RecordBatch,
+        batch_size: usize,
+        pool_batches: usize,
+    ) -> Result<(Arc<SortExec>, Arc<TaskContext>)> {
+        let schema = batch.schema();
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(get_record_batch_memory_size(&batch) * pool_batches, 1.0)
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+            )
+            .build_arc()?;
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(batch_size))
+                .with_runtime(runtime),
+        );
+        let plan =
+            TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let sort_exec = Arc::new(SortExec::new(
+            [
+                PhysicalSortExpr::new_default(col("tag", &schema)?),
+                PhysicalSortExpr::new_default(col("time", &schema)?),
+            ]
+            .into(),
+            plan,
+        ));
+        Ok((sort_exec, task_ctx))
+    }
+
+    fn batches_memory_size(batches: &[RecordBatch]) -> usize {
+        let mut counter = RecordBatchMemoryCounter::new();
+        batches.iter().map(|batch| counter.count_batch(batch)).sum()
+    }
+
+    #[tokio::test]
+    async fn test_sort_single_batch_shared_dictionary_reservation() -> Result<()> {
+        const ROWS: usize = 100_000;
+        const BATCH_SIZE: usize = 1_000;
+
+        let (sort_exec, task_ctx) =
+            shared_dictionary_sort(shared_dictionary_batch(ROWS)?, BATCH_SIZE, 4)?;
+
+        let result = collect(sort_exec, task_ctx).await?;
+        let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, ROWS);
+        assert_eq!(result.len(), ROWS.div_ceil(BATCH_SIZE));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sort_shared_dictionary_release_per_batch() -> Result<()> {
+        const ROWS: usize = 10_000;
+        const BATCH_SIZE: usize = 1_000;
+
+        let batch = shared_dictionary_batch(ROWS)?;
+        let (sort_exec, task_ctx) = shared_dictionary_sort(batch.clone(), BATCH_SIZE, 4)?;
+        let expected = sort_batch_chunked(&batch, sort_exec.expr(), BATCH_SIZE)?;
+        let mut stream = sort_exec.execute(0, Arc::clone(&task_ctx))?;
+
+        // Emitted batches are dropped right away; the pool must still hold
+        // what the queued batches reference, shared dictionary included.
+        for emitted in 1..=expected.len() {
+            drop(stream.next().await.unwrap()?);
+            assert_eq!(
+                task_ctx.memory_pool().reserved(),
+                batches_memory_size(&expected[emitted..]),
+                "after {emitted} of {} batches",
+                expected.len()
+            );
+        }
+        assert!(stream.next().await.is_none());
+        assert_eq!(task_ctx.memory_pool().reserved(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sort_shared_dictionary_release_on_drop() -> Result<()> {
+        let (sort_exec, task_ctx) =
+            shared_dictionary_sort(shared_dictionary_batch(10_000)?, 1_000, 4)?;
+        let mut stream = sort_exec.execute(0, Arc::clone(&task_ctx))?;
+
+        drop(stream.next().await.unwrap()?);
+        assert!(task_ctx.memory_pool().reserved() > 0);
+
+        drop(stream);
+        assert_eq!(task_ctx.memory_pool().reserved(), 0);
         Ok(())
     }
 
