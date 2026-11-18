@@ -62,6 +62,8 @@ use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
+use crate::physical_optimizer::test_utils::RequirementsTestExec;
+
 const TEST_TARGET_PARTITIONS: usize = 8;
 
 /// Mock ExecutionPlan with configurable partition count and output ordering.
@@ -80,6 +82,14 @@ impl MockMultiPartitionExec {
     fn hash_partitioned_on_a(partition_count: usize) -> Self {
         Self::with_partitioning(Partitioning::Hash(
             vec![Arc::new(Column::new("a", 0))],
+            partition_count,
+        ))
+    }
+
+    /// A source that is partitioned on `b`, so it does not satisfy a key requirement on `a`.
+    fn hash_partitioned_on_b(partition_count: usize) -> Self {
+        Self::with_partitioning(Partitioning::Hash(
+            vec![Arc::new(Column::new("b", 1))],
             partition_count,
         ))
     }
@@ -1430,5 +1440,225 @@ fn test_collect_left_join_keeps_hash_partitioned_build_side_coalesce() -> Result
           MockMultiPartitionExec
     ");
 
+    Ok(())
+}
+
+/// Builds the plan shape that phase 3a (`parallelize_sorts`) sees when a global sort is
+/// above an operator that requires its input partitioned on `a`, and a
+/// `CoalescePartitionsExec` satisfies that requirement:
+///
+/// ```text
+/// SortExec: [a ASC], preserve_partitioning=false  <- the node `parallelize_sorts` rewrites
+///   RequiredInputOrderingExec                     <- requires KeyPartitioned([a])
+///     ...pass_through RequiredInputOrderingExec nodes (no requirement)...
+///       CoalescePartitionsExec                    <- links the sort to the coalesce
+///         <source>
+/// ```
+///
+/// This is the shape of a `FinalPartitioned` `AggregateExec` that reads a coalesced input,
+/// as the distribution phase plans it when the row-count estimates are small.
+fn key_requirement_plan_before_parallelize_sorts(
+    source: Arc<dyn ExecutionPlan>,
+    pass_through: usize,
+) -> Arc<dyn ExecutionPlan> {
+    let mut plan: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(source));
+    for _ in 0..pass_through {
+        plan = RequirementsTestExec::new(plan).into_arc();
+    }
+    let plan = RequirementsTestExec::new(plan)
+        .with_required_input_distribution(Distribution::KeyPartitioned(vec![Arc::new(
+            Column::new("a", 0),
+        )]))
+        .into_arc();
+    Arc::new(SortExec::new(sort_expr_on("a", 0, false, false), plan))
+}
+
+/// One partition satisfies any key requirement, so a `CoalescePartitionsExec` can be what
+/// satisfies `KeyPartitioned([a])`. When the input of the coalesce is partitioned on a
+/// different key, the sort-parallelization phase must keep the coalesce.
+///
+/// It used to remove it, because `remove_bottleneck_in_subplan` protected a coalesce only
+/// below a `SinglePartition` requirement. The operator then read several partitions that
+/// are partitioned on `b`, and `SanityCheckPlan` rejected the plan with "does not satisfy
+/// distribution requirements: KeyPartitioned[[a@0]]".
+#[test]
+fn test_key_requirement_keeps_coalesce() -> Result<()> {
+    let plan = key_requirement_plan_before_parallelize_sorts(
+        Arc::new(MockMultiPartitionExec::hash_partitioned_on_b(
+            TEST_TARGET_PARTITIONS,
+        )),
+        0,
+    );
+
+    let rewritten = parallelize_sorts_and_sanity_check(plan)?;
+
+    // The sort input stays one partition, so the sort stays as it is, without a merge.
+    assert_snapshot!(plan_string(&rewritten), @"
+    SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
+      RequiredInputOrderingExec
+        CoalescePartitionsExec
+          MockMultiPartitionExec
+    ");
+
+    Ok(())
+}
+
+/// The same requirement, with the coalesce further down the plan. The removal changes the
+/// partitioning of the nodes between the coalesce and the operator with the requirement, so
+/// the check must be made on the rewritten child, not only on a coalesce directly below.
+#[test]
+fn test_key_requirement_keeps_coalesce_below_other_nodes() -> Result<()> {
+    let plan = key_requirement_plan_before_parallelize_sorts(
+        Arc::new(MockMultiPartitionExec::hash_partitioned_on_b(
+            TEST_TARGET_PARTITIONS,
+        )),
+        2,
+    );
+
+    let rewritten = parallelize_sorts_and_sanity_check(plan)?;
+
+    assert_snapshot!(plan_string(&rewritten), @"
+    SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
+      RequiredInputOrderingExec
+        RequiredInputOrderingExec
+          RequiredInputOrderingExec
+            CoalescePartitionsExec
+              MockMultiPartitionExec
+    ");
+
+    Ok(())
+}
+
+/// When the input of the coalesce is already partitioned on the required key, the coalesce
+/// is an avoidable bottleneck. The phase removes it and runs the sort in parallel, as
+/// before.
+#[test]
+fn test_key_requirement_removes_coalesce_when_input_satisfies_it() -> Result<()> {
+    let plan = key_requirement_plan_before_parallelize_sorts(
+        Arc::new(MockMultiPartitionExec::hash_partitioned_on_a(
+            TEST_TARGET_PARTITIONS,
+        )),
+        1,
+    );
+
+    let rewritten = parallelize_sorts_and_sanity_check(plan)?;
+
+    assert_snapshot!(plan_string(&rewritten), @"
+    SortPreservingMergeExec: [a@0 ASC NULLS LAST]
+      RequiredInputOrderingExec
+        RequiredInputOrderingExec
+          MockMultiPartitionExec
+    ");
+
+    Ok(())
+}
+
+/// Runs `SELECT t, sum(v) FROM (SELECT t, avg(v) AS v FROM x GROUP BY t, i ORDER BY i, t)
+/// GROUP BY t ORDER BY t` through a `SessionContext` with `target_partitions` partitions.
+///
+/// With the row-count estimates of the small `MemTable`, the planner does not
+/// hash-repartition the input of the outer aggregate. The outer aggregate reads a
+/// `CoalescePartitionsExec` over the output of the inner one, which is hash partitioned on
+/// `[t, i]`. Returns the physical plan and the result rows.
+async fn run_sum_of_avg_query(
+    target_partitions: usize,
+) -> Result<(Arc<dyn ExecutionPlan>, Vec<arrow::array::RecordBatch>)> {
+    use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+    use datafusion::datasource::MemTable;
+    use datafusion::functions_aggregate::expr_fn::{avg, sum};
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::{SessionConfig, SessionContext, col};
+    use datafusion_expr::LogicalPlanBuilder;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("t", DataType::Int64, false),
+        Field::new("i", DataType::Utf8, false),
+        Field::new("v", DataType::Float64, false),
+    ]));
+    let batch = |t: Vec<i64>, i: Vec<&str>, v: Vec<f64>| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(t)),
+                Arc::new(StringArray::from(i)),
+                Arc::new(Float64Array::from(v)),
+            ],
+        )
+    };
+    let table = MemTable::try_new(
+        Arc::clone(&schema),
+        vec![
+            vec![batch(
+                vec![0, 0, 5],
+                vec!["a", "b", "a"],
+                vec![1.0, 2.0, 3.0],
+            )?],
+            vec![batch(
+                vec![5, 10, 10],
+                vec!["b", "a", "b"],
+                vec![4.0, 5.0, 6.0],
+            )?],
+        ],
+    )?;
+
+    let mut config = SessionConfig::new().with_target_partitions(target_partitions);
+    config
+        .options_mut()
+        .execution
+        .use_row_number_estimates_to_optimize_partitioning = true;
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_table("x", Arc::new(table))?;
+
+    let scan = ctx.table("x").await?.into_unoptimized_plan();
+    let plan = LogicalPlanBuilder::from(scan)
+        .aggregate(vec![col("t"), col("i")], vec![avg(col("v")).alias("v")])?
+        .sort(vec![col("i").sort(true, false), col("t").sort(true, false)])?
+        .project(vec![col("t"), col("v")])?
+        .aggregate(vec![col("t")], vec![sum(col("v")).alias("s")])?
+        .sort(vec![col("t").sort(true, false)])?
+        .build()?;
+
+    let physical = ctx.state().create_physical_plan(&plan).await?;
+    SanityCheckPlan::new()
+        .optimize(Arc::clone(&physical), ctx.state().config_options())?;
+    let batches = collect(Arc::clone(&physical), ctx.task_ctx()).await?;
+    Ok((physical, batches))
+}
+
+/// An aggregate that requires its input hash partitioned on its group key can be fed by a
+/// `CoalescePartitionsExec`: one partition satisfies any hash requirement. The
+/// sort-parallelization phase must not remove that coalesce when the input below it is
+/// hash partitioned on a different key.
+///
+/// Here the outer aggregate groups by `t` and the coalesce sits on the output of the inner
+/// aggregate, which is hash partitioned on `[t, i]`. Removing the coalesce gave the outer
+/// aggregate rows of one `t` in several partitions, and `SanityCheckPlan` rejected the plan.
+#[tokio::test]
+async fn test_sum_of_avg_keeps_coalesce_under_hash_requirement() -> Result<()> {
+    let (plan, batches) = run_sum_of_avg_query(4).await?;
+    let (_, expected) = run_sum_of_avg_query(1).await?;
+
+    let actual = arrow::util::pretty::pretty_format_batches(&batches)?.to_string();
+    let expected = arrow::util::pretty::pretty_format_batches(&expected)?.to_string();
+    assert_eq!(actual, expected, "plan:\n{}", plan_string(&plan));
+    assert_snapshot!(actual, @r"
+    +----+------+
+    | t  | s    |
+    +----+------+
+    | 0  | 3.0  |
+    | 5  | 7.0  |
+    | 10 | 11.0 |
+    +----+------+
+    ");
+    assert_snapshot!(plan_string(&plan), @"
+    SortExec: expr=[t@0 ASC NULLS LAST], preserve_partitioning=[false]
+      AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(v) as s]
+        CoalescePartitionsExec
+          ProjectionExec: expr=[t@0 as t, v@2 as v]
+            AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, i@1 as i], aggr=[avg(x.v) as v]
+              RepartitionExec: partitioning=Hash([t@0, i@1], 4), input_partitions=2
+                AggregateExec: mode=Partial, gby=[t@0 as t, i@1 as i], aggr=[avg(x.v) as v]
+                  DataSourceExec: partitions=2, partition_sizes=[1, 1]
+    ");
     Ok(())
 }

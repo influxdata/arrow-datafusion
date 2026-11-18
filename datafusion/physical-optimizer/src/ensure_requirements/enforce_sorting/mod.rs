@@ -69,7 +69,9 @@ use datafusion_physical_plan::tree_node::PlanContext;
 use datafusion_physical_plan::windows::{
     BoundedWindowAggExec, WindowAggExec, get_best_fitting_window,
 };
-use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, InputOrderMode};
+use datafusion_physical_plan::{
+    ChildSatisfactionOptions, ExecutionPlan, ExecutionPlanProperties, InputOrderMode,
+};
 
 use itertools::izip;
 
@@ -344,6 +346,18 @@ pub fn parallelize_sorts(
         // the `CoalescePartitionsExec` + `SortExec` cascade with a `SortExec`
         // + `SortPreservingMergeExec` cascade to parallelize sorting.
         requirements = remove_bottleneck_in_subplan(requirements)?;
+        // `remove_bottleneck_in_subplan` keeps a coalesce that satisfies a distribution
+        // requirement. If the input of the sort is still one partition, the sort cannot run
+        // in parallel, and a `SortPreservingMergeExec` above it would merge one partition.
+        if requirements.children[0]
+            .plan
+            .output_partitioning()
+            .partition_count()
+            <= 1
+        {
+            requirements.data = false;
+            return Ok(Transformed::yes(requirements));
+        }
         // We also need to remove the self node since `remove_corresponding_coalesce_in_sub_plan`
         // deals with the children and their children and so on.
         requirements = requirements.children.swap_remove(0);
@@ -647,21 +661,29 @@ fn remove_bottleneck_in_subplan_impl(
     mut requirements: PlanWithCorrespondingCoalescePartitions,
     is_root: bool,
 ) -> Result<PlanWithCorrespondingCoalescePartitions> {
-    let plan = &requirements.plan;
-    // Below the root, a `CoalescePartitionsExec` feeding a child that requires
-    // `Distribution::SinglePartition` is not an avoidable bottleneck: it is what satisfies
-    // that requirement. Removing it leaves the parent with a multi-partition input it cannot
-    // accept, and nothing re-runs distribution enforcement afterwards, so the plan reaches
-    // `SanityCheckPlan` invalid. The traversal reaches such a node because
-    // `update_coalesce_ctx_children` marks a node as connected when *any* child qualifies:
-    // a `CollectLeft` `HashJoinExec` whose probe side is connected is descended into even
-    // though its build side must stay single-partition.
+    let plan = Arc::clone(&requirements.plan);
+    // Below the root, a `CoalescePartitionsExec` is not an avoidable bottleneck when it is
+    // what satisfies the distribution requirement of the operator above it. Removing it
+    // leaves that operator with an input it cannot accept, and nothing re-runs distribution
+    // enforcement afterwards, so the plan reaches `SanityCheckPlan` invalid. The traversal
+    // reaches such a node because `update_coalesce_ctx_children` marks a node as connected
+    // when *any* child qualifies, and it links through every child whose requirement is not
+    // `SinglePartition`.
     //
-    // Only `SinglePartition` is protected. A `HashPartitioned` child is in principle in the
-    // same position — a single-partition input trivially satisfies a hash requirement, so a
-    // coalesce below one is also load-bearing — but nothing puts a coalesce there:
-    // `ensure_distribution` satisfies a hash requirement with a `RepartitionExec`, never a
-    // `CoalescePartitionsExec`. Widening the check would be dead code today.
+    // There are two cases:
+    //
+    // - A child that requires `Distribution::SinglePartition` is not descended into at all:
+    //   no removal below it can keep it single-partitioned. Example: the build side of a
+    //   `CollectLeft` `HashJoinExec` whose probe side is connected.
+    // - A child that requires `Distribution::KeyPartitioned` (or the deprecated
+    //   `HashPartitioned`) can also be satisfied by a coalesce, because one partition
+    //   satisfies any key requirement. The removal is kept only if the rewritten child still
+    //   satisfies the requirement, by the same check `SanityCheckPlan` uses, and the
+    //   children still satisfy a co-partitioning requirement of `plan`. Otherwise the child
+    //   is restored. Example: a `FinalPartitioned` `AggregateExec` on `[t]` whose input is a
+    //   coalesce over a plan that is hash partitioned on `[t, i]`. If the input of the
+    //   coalesce is already partitioned on the key, the removal is kept, and the sorts above
+    //   still run in parallel.
     let dist_reqs = plan.input_distribution_requirements();
     let removable = |idx: usize| {
         is_root
@@ -673,13 +695,32 @@ fn remove_bottleneck_in_subplan_impl(
     let remove_from_first_child = requirements.children.first().is_some_and(|child| {
         is_coalesce_partitions(&child.plan) && child.plan.fetch().is_none()
     }) && removable(0);
+    // Copies of the children that the rewrite below can change and whose requirement it
+    // can break. The root is exempt, see `remove_bottleneck_in_subplan`.
+    let mut originals = requirements
+        .children
+        .iter()
+        .enumerate()
+        .map(|(idx, child)| {
+            let touched = if remove_from_first_child {
+                idx == 0
+            } else {
+                child.data && removable(idx)
+            };
+            let has_requirement = !matches!(
+                dist_reqs.child_distribution(idx),
+                None | Some(Distribution::UnspecifiedDistribution)
+            );
+            (!is_root && touched && has_requirement).then(|| copy_coalesce_ctx(child))
+        })
+        .collect::<Vec<_>>();
     let children = &mut requirements.children;
     if remove_from_first_child {
         // We can safely use the 0th index since we have a `CoalescePartitionsExec`.
         let mut new_child_node = children[0].children.swap_remove(0);
         while new_child_node.plan.output_partitioning() == plan.output_partitioning()
             && is_repartition(&new_child_node.plan)
-            && is_repartition(plan)
+            && is_repartition(&plan)
         {
             new_child_node = new_child_node.children.swap_remove(0)
         }
@@ -702,6 +743,7 @@ fn remove_bottleneck_in_subplan_impl(
             })
             .collect::<Result<_>>()?;
     }
+    restore_unsatisfied_children(&plan, &mut requirements.children, &mut originals)?;
     let mut new_reqs = requirements.update_plan_from_children()?;
     if let Some(repartition) = new_reqs.plan.downcast_ref::<RepartitionExec>() {
         let input_partitioning = repartition.input().output_partitioning();
@@ -716,6 +758,58 @@ fn remove_bottleneck_in_subplan_impl(
         }
     }
     Ok(new_reqs)
+}
+
+/// Puts back the original of each child in `originals` whose rewritten version no longer
+/// satisfies the distribution requirement of `plan` for that child. If the children then
+/// do not satisfy a co-partitioning requirement of `plan`, puts back all the originals.
+fn restore_unsatisfied_children(
+    plan: &Arc<dyn ExecutionPlan>,
+    children: &mut [PlanWithCorrespondingCoalescePartitions],
+    originals: &mut [Option<PlanWithCorrespondingCoalescePartitions>],
+) -> Result<()> {
+    if originals.iter().all(Option::is_none) {
+        return Ok(());
+    }
+    let dist_reqs = plan.input_distribution_requirements();
+    // Subsets are allowed: `SanityCheckPlan` accepts them, and a partitioning on a subset
+    // of the keys keeps all the rows of a key in one partition.
+    let options = ChildSatisfactionOptions::new().with_allow_subset(true);
+    for (idx, original) in originals.iter_mut().enumerate() {
+        if original.is_some()
+            && !dist_reqs
+                .child_satisfaction(idx, children[idx].plan.as_ref(), options)?
+                .is_satisfied()
+        {
+            children[idx] = original.take().expect("checked above");
+        }
+    }
+    let child_plans = children
+        .iter()
+        .map(|child| child.plan.as_ref())
+        .collect::<Vec<_>>();
+    if !dist_reqs
+        .unsatisfied_co_partitioned_children(plan.name(), &child_plans)?
+        .is_empty()
+    {
+        for (child, original) in children.iter_mut().zip(originals.iter_mut()) {
+            if let Some(original) = original.take() {
+                *child = original;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copies a [`PlanWithCorrespondingCoalescePartitions`] tree. The plans are shared.
+fn copy_coalesce_ctx(
+    ctx: &PlanWithCorrespondingCoalescePartitions,
+) -> PlanWithCorrespondingCoalescePartitions {
+    PlanWithCorrespondingCoalescePartitions::new(
+        Arc::clone(&ctx.plan),
+        ctx.data,
+        ctx.children.iter().map(copy_coalesce_ctx).collect(),
+    )
 }
 
 /// Updates child to remove the unnecessary sort below it.
